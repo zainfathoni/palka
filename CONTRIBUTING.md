@@ -19,7 +19,17 @@ git diff --check
 
 The check validates local Markdown file links and text hygiene. It does not
 check external URLs, full Markdown syntax, secrets, or runtime behavior.
-CI runs the same check on pushes and pull requests.
+CI runs this check and the Docker integration tests on pushes and pull
+requests. For runtime work, also run:
+
+```sh
+python3 -m unittest discover -s tests -v
+```
+
+These tests need Linux x64 and Docker access. They build a synthetic image,
+create disposable containers, and remove their own test resources. They do
+not register a provider or connect to Amp. Docker can pull the pinned public
+base image. Do not use private runtime data for these tests.
 
 ## Changes and tests
 

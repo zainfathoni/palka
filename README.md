@@ -7,8 +7,10 @@ extension or dependency.
 
 ## Status
 
-This repository contains the project foundation and delivery plan. It does
-not yet contain a runtime, an installer, or an active Orb provider.
+This repository contains an initial Docker lifecycle dispatch program and
+its tests. It is not ready for a live provider. Concurrent-job recovery,
+project snapshots, resource limits, and service packaging are follow-up work.
+There is no installer or active Orb provider.
 
 The first runtime will use Docker on Linux. Apple Containers on Apple Silicon
 macOS is next. E2B Embed is a possible later option, not the initial stack.
@@ -27,6 +29,7 @@ tool output or model inference off Amp. See the [security guidance](SECURITY.md)
 ## Read and contribute
 
 - [Runtime contract and design constraints](docs/runtime-contract.md)
+- [Docker lifecycle use and limits](docs/docker.md)
 - [Delivery plan](docs/roadmap.md)
 - [Domain glossary](CONTEXT.md)
 - [Contribution guide](CONTRIBUTING.md)
@@ -40,6 +43,16 @@ python3 scripts/check.py
 ```
 
 These checks do not start containers or connect a provider.
+
+Run the Docker integration tests on Linux x64 with a working Docker CLI and
+daemon:
+
+```sh
+python3 -m unittest discover -s tests -v
+```
+
+The tests build a small synthetic image and use disposable containers. They
+do not connect to Amp. See [the test requirements](docs/docker.md#verification).
 
 ## License
 

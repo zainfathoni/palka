@@ -1,6 +1,7 @@
 # Runtime contract
 
-Status: requirements for follow-up implementation, not implemented behavior.
+Status: requirements for the full runtime. The initial Docker lifecycle
+implements only the subset described in [the Docker guide](docker.md).
 
 Source: [Amp self-hosted Orbs](https://ampcode.com/docs/orbs/self-hosted),
 checked on 2026-10-22. The current upstream contract takes precedence if it

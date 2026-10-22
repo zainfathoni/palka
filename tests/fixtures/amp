@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Synthetic bootstrap fixture. Never use this image for a live provider.
+set -euo pipefail
+test "$*" = "orb bootstrap"
+test -z "${AMP_ORB_PROVIDER_TOKEN-}"
+printf '%s\n' "$ORB_TOKEN" >&1
+printf '%s\n' "$ORB_TOKEN" >&2
+if [[ "${AMP_URL-}" == https://bootstrap-failure.invalid ]]; then exit 7; fi
+printf '%s\n' "$(id -un)" "$ORB_TOKEN" "${AMP_URL-}" "$$" > /tmp/bootstrap-record.next
+mv /tmp/bootstrap-record.next /tmp/bootstrap-record
+exec sleep infinity

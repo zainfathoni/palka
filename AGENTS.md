@@ -1,7 +1,8 @@
 # Palka agent instructions
 
 Palka is a separate machine-local runtime project. Amp owns scheduling,
-threads, and the agent loop. This foundation has no implemented runtime.
+threads, and the agent loop. The initial Docker lifecycle exists; full
+runtime readiness follows the issue plan.
 
 Before runtime changes, read [the contract](docs/runtime-contract.md) and
 check its current upstream source. Keep retained Orb disks distinct from
