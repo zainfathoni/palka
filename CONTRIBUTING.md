@@ -36,8 +36,6 @@ or activating a provider service.
 Write short, clear English using ASD-STE100 Simplified Technical English.
 Keep code and examples free of private host data and credentials.
 
-## License status
+## License
 
-The owner has not selected a license. Do not add a license header or assume
-that a recommendation is an owner license grant. Resolve the license before
-accepting outside contributions or publishing a release.
+Contributions use the repository's [MIT license](LICENSE).

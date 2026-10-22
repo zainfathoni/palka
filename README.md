@@ -43,8 +43,7 @@ These checks do not start containers or connect a provider.
 
 ## License
 
-The owner has not selected a license. Apache-2.0 is a recommendation, not a
-grant of rights. Until a license is added, the default copyright rules apply.
+Palka uses the [MIT license](LICENSE).
 
 ## Upstream requirements
 

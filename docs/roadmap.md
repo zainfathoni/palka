@@ -43,7 +43,6 @@ plane, public endpoint, and dashboard are outside the current scope.
 
 ## Approval gates
 
-- The owner selects the repository license.
 - The owner approves publishing local commits if not already authorized.
 - The operator approves live provider registration and service activation.
 - Access to another machine requires separate approval.
