@@ -2,10 +2,9 @@
 
 ## Report a vulnerability
 
-Use [GitHub private vulnerability reporting](https://github.com/zainfathoni/palka/security/advisories/new)
-if it is enabled. If that page is not available, use the contact route on the
-owner's [GitHub profile](https://github.com/zainfathoni). Ask for a private
-channel without including exploit details. Do not put secrets or private
+Email the owner at [me@zainf.dev](mailto:me@zainf.dev), the public contact on
+the owner's [GitHub profile](https://github.com/zainfathoni). For sensitive
+data, first ask for a suitable transfer method. Do not put secrets or private
 runtime data in a public issue.
 
 There is no runtime release yet. Security fixes will target the current main
@@ -15,6 +14,9 @@ branch until a release support policy is published.
 
 - Amp controls the agent loop and model inference. Tool results, file reads,
   diffs, screenshots, and attachments can leave the host and be stored by Amp.
+- Dispatch stdout and stderr go to the provider log. Spawn output also
+  appears in the thread setup log stored by Amp. Keep both streams free of
+  credentials and private runtime data, including on failure paths.
 - The provider credential authorizes provider jobs. Keep it separate from
   the short-lived `ORB_TOKEN` that connects one Orb to its thread.
 - The provider can control the container runtime. Docker access can provide

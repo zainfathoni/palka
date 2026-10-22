@@ -5,7 +5,8 @@ threads, and the agent loop. This foundation has no implemented runtime.
 
 Before runtime changes, read [the contract](docs/runtime-contract.md) and
 check its current upstream source. Keep retained Orb disks distinct from
-reusable project snapshots. Neither Docker nor Apple stop/start retains RAM.
+reusable project snapshots. Treat stop/start as disk-only resume, not RAM
+retention. Verify Apple behavior on approved hardware before claiming support.
 
 Use synthetic data for tests and public evidence. Keep credentials, private
 host details, and runtime state out of the repository. Provider activation,

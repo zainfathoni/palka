@@ -27,8 +27,8 @@ The dispatch program receives no arguments. Input is in the environment.
 | `ORB_ID` | Stable Orb identity; repeated jobs address the same Orb |
 | `ORB_IMAGE` | Base image supplied by Amp |
 | `ORB_SNAPSHOT_ID` | Optional project snapshot to restore or save |
-| `ORB_TOKEN` | Short-lived spawn credential for this Orb's connection |
-| `AMP_URL` | Spawn server override when the server is not ampcode.com |
+| `ORB_TOKEN` | Spawn only. Short-lived credential for this Orb's connection |
+| `AMP_URL` | Spawn only. Server override when the server is not ampcode.com |
 
 Validate operation and identifiers before a runtime call. Treat input as
 data, not shell syntax. Use an ownership marker and a local namespace so an
@@ -59,7 +59,9 @@ must not reuse an old override.
 ## Persistence and snapshots
 
 Docker stop/start retains the writable disk, not running processes or RAM.
-Apple Containers stop/start has the same distinction. Bootstrap starts again
+Require the same disk-only behavior for Apple Containers. Verify it in
+[the feasibility task](https://github.com/zainfathoni/palka/issues/10) on
+approved hardware before claiming platform support. Bootstrap starts again
 on resume. A service or process inside the Orb must not be assumed to survive.
 
 A retained disk belongs to one Orb. A project snapshot is a separate copy
@@ -96,6 +98,10 @@ cannot enforce. Keep stopped Orbs and snapshots in capacity accounting.
 A one-Orb, 2-CPU, 4-GiB pilot is only a proposed starting limit. It is not a
 measured host capacity or a production default. Measure lifecycle time,
 memory, disk growth, and behavior under pressure before raising limits.
+
+Dispatch stdout and stderr go to the provider log. Spawn output also appears
+in the thread setup log stored by Amp. Keep both streams free of credentials
+and private runtime data, including on failure paths.
 
 Logs may contain job identity, operation, duration, and a sanitized error.
 Never log tokens, environment dumps, repository contents, or snapshot data.
