@@ -1,7 +1,9 @@
-# Initial Docker lifecycle
+# Docker lifecycle
 
-This is the first implementation slice, not a production-ready Orb provider.
-It implements task [#3](https://github.com/zainfathoni/palka/issues/3).
+This is an initial implementation, not a production-ready Orb provider.
+It implements the lifecycle and recovery tasks
+[#3](https://github.com/zainfathoni/palka/issues/3) and
+[#4](https://github.com/zainfathoni/palka/issues/4).
 Do not activate a live provider with this version.
 
 ## Requirements
@@ -10,7 +12,7 @@ Do not activate a live provider with this version.
 - Permission to manage local Docker containers. This grants broad host access.
 - A Linux amd64/glibc image that meets the current
   [Amp image requirements](https://ampcode.com/docs/orbs/self-hosted).
-- Bash, coreutils, util-linux `setsid`, and `amp` inside the image. Bootstrap
+- Bash, coreutils, util-linux `setsid` and `flock`, and `amp` inside the image. Bootstrap
   runs as the image's default user. No root-user override is added.
 
 The dispatch uses Python's standard library and the Docker CLI. It has no
@@ -42,7 +44,7 @@ security boundary against another user with Docker access.
   as the entrypoint and Docker's init process. It starts detached bootstrap
   with the current token and server override. An unset `AMP_URL` clears any
   image default or prior override.
-- A serial repeat `spawn` replaces only the prior bootstrap process group.
+- A repeat `spawn` replaces only the prior bootstrap process group.
   It preserves the running container and unrelated Orb processes. The PID
   record includes a process start time to avoid selecting a reused PID.
 - `pause` stops the container with a ten-second stop grace and keeps its disk.
@@ -53,6 +55,39 @@ The writable layer is retained on stop/start. `/tmp` is a tmpfs mount and is
 cleared on stop, including the bootstrap PID record. Running processes and
 RAM are not retained. No host mounts, runtime socket, privileged mode, or
 provider credential are passed to the Orb.
+
+## Concurrency and recovery
+
+Palka locks each Orb before it reads or changes Docker state. Independent
+Orbs have separate locks. Every dispatch process for the same Docker daemon
+must use the same local state directory and user. Set `PALKA_STATE_DIR` to
+an absolute path on a local filesystem, or use the default
+`$XDG_STATE_HOME/palka` (`$HOME/.local/state/palka` when unset).
+Keep this directory private. Do not share it over a network filesystem.
+
+Lock files stay in this directory. Do not remove them while jobs can run:
+removal can let two jobs lock different files for the same Orb. The kernel
+releases a lock when its dispatch process exits. Docker names and ownership
+labels find retained containers after a provider or host restart.
+
+Before start or stop, Palka saves a recovery record with the immutable
+container ID and operation. The next job finishes that transition before it
+handles new work. This prevents a pending Docker stop from later stopping a
+resumed Orb. A changed container ID or damaged record requires inspection;
+Palka does not guess or delete retained disks to repair it. Do not discard
+recovery records during an upgrade or service removal.
+
+Bootstrap launch also has an in-container lock. The child saves its PID and
+start time before it runs `amp`, then closes its copy of the lock. A Docker
+exec that outlives an interrupted host client cannot launch a second
+unrecorded bootstrap. Pause clears this temporary in-container state.
+
+Each job has one 240-second deadline, including lock waits. Set
+`PALKA_JOB_TIMEOUT_SECONDS` to a finite value greater than zero and at most
+240 to use a shorter budget. Timeout or termination kills the Docker client
+process group and returns a sanitized error. It cannot guarantee that the
+Docker daemon cancelled work. Retry through dispatch to recover a pending
+transition, rather than run conflicting manual Docker commands.
 
 ## Credentials and output
 
@@ -70,12 +105,9 @@ when a sanitized error is not enough. No environment dump is produced.
 
 ## Current limits
 
-- Each job shares a 240-second command budget. A timeout fails the dispatch;
-  killing the Docker client does not guarantee that the daemon cancelled work.
-  Inspect the owned resource before retrying a timed-out job.
-- Jobs must be serialized by the caller. Concurrent operations, interruption
-  recovery, and bootstrap failure after launch need
-  [task #4](https://github.com/zainfathoni/palka/issues/4).
+- Recovery tests cover interrupted dispatch processes, not a physical host
+  reboot or loss of the Docker storage filesystem. A host restart must use
+  the same retained Docker storage and Palka state directory.
 - A successful spawn checks that the bootstrap process launched, not that it
   completed its Amp connection. No live Amp connection has been tested.
 - `ORB_SNAPSHOT_ID` is accepted but not used. Spawn uses the retained disk or
@@ -102,8 +134,13 @@ disclosure. It also has a stale image server default that a later spawn must
 clear. Its credential observation file lives only in tmpfs.
 
 The suite checks disk retention, default-user bootstrap, fresh credentials,
-serial repeat operations, unrelated resources, ownership collisions, invalid
-input, failed image creation, and an unreachable daemon. It removes its own
+repeat and concurrent operations, unrelated resources, ownership collisions,
+invalid input, failed image creation, an unreachable daemon, lock deadlines,
+and interruption after create, start, exec, stop, and removal. It also
+interrupts a slow stop before it completes and checks that a resumed Orb
+stays running. Concurrent spawn/pause can finish running or stopped, but
+must keep the same sentinel disk. Concurrent spawn/delete can finish running
+on a new disk or absent; the deleted disk must not return. It removes its own
 containers and image tag. It does not prune Docker's shared build cache or
 remove unrelated resources. A failed or interrupted test can need manual
 cleanup of its uniquely named disposable resources.

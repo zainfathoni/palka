@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+"""Hold a public Docker CLI call after a real side effect for fault tests."""
+
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+command = [os.environ["PALKA_TEST_DOCKER"], *sys.argv[1:]]
+if sys.argv[1] != os.environ["PALKA_TEST_STAGE"]:
+    os.execv(command[0], command)
+result = subprocess.run(command)
+if result.returncode == 0:
+    barrier = Path(os.environ["PALKA_TEST_BARRIER"])
+    (barrier / os.environ["ORB_ID"]).touch()
+    while not (barrier / "release").exists():
+        time.sleep(0.02)
+sys.exit(result.returncode)

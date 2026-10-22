@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """Handle one Amp Orb lifecycle job with the local Docker CLI."""
 
+from contextlib import contextmanager
+import fcntl
 import json
+import math
 import os
+from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -14,6 +19,8 @@ command -v amp >/dev/null
 umask 077
 state=/tmp/.palka-bootstrap
 mkdir -p "$state"
+exec 9>"$state/lock"
+flock -x -w 5 9
 start_time() {
     local stat
     local -a fields
@@ -21,6 +28,7 @@ start_time() {
     read -ra fields <<< "${stat##*) }"
     printf '%s' "${fields[19]}"
 }
+export -f start_time
 if [[ -f "$state/pid" ]]; then
     read -r old stamp < "$state/pid"
     [[ "$old" =~ ^[0-9]+$ && "$stamp" =~ ^[0-9]+$ ]] && (( old > 1 )) || exit 1
@@ -35,10 +43,15 @@ if [[ -f "$state/pid" ]]; then
         fi
     fi
 fi
-setsid amp orb bootstrap </dev/null >/dev/null 2>&1 &
+setsid bash -euc '
+    state=/tmp/.palka-bootstrap
+    stamp=$(start_time "$$")
+    printf "%s %s\\n" "$$" "$stamp" > "$state/pid.next"
+    mv "$state/pid.next" "$state/pid"
+    exec 9>&-
+    exec amp orb bootstrap
+' </dev/null >/dev/null 2>&1 &
 pid=$!
-stamp=$(start_time "$pid")
-printf '%s %s\\n' "$pid" "$stamp" > "$state/pid"
 sleep 0.1
 kill -0 "$pid"
 """
@@ -46,6 +59,29 @@ kill -0 "$pid"
 
 class DispatchError(Exception):
     """A safe message that can appear in provider and thread logs."""
+
+
+@contextmanager
+def lock(name: str, deadline: float):
+    root = Path(os.environ.get("PALKA_STATE_DIR") or Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "palka")
+    try:
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(root / (name + ".lock"), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    except OSError:
+        raise DispatchError("local state lock could not open") from None
+    try:
+        while True:
+            if time.monotonic() >= deadline:
+                raise DispatchError("job timed out waiting for local state lock")
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+        yield root
+    finally:
+        # Keep the file. Removing it can give waiting jobs different lock inodes.
+        os.close(fd)
 
 
 def main() -> None:
@@ -64,28 +100,47 @@ def main() -> None:
         if not os.environ.get("ORB_TOKEN"):
             raise DispatchError("spawn requires ORB_TOKEN")
 
-    deadline = time.monotonic() + 240
+    try:
+        budget = float(os.environ.get("PALKA_JOB_TIMEOUT_SECONDS", "240"))
+    except ValueError:
+        raise DispatchError("PALKA_JOB_TIMEOUT_SECONDS must be greater than zero and at most 240") from None
+    if not math.isfinite(budget) or not 0 < budget <= 240:
+        raise DispatchError("PALKA_JOB_TIMEOUT_SECONDS must be greater than zero and at most 240")
+    deadline = time.monotonic() + budget
+    with lock("orb-" + orb_id, deadline) as state:
+        dispatch(operation, orb_id, image, deadline, state)
+
+
+def dispatch(operation: str, orb_id: str, image: str, deadline: float, state: Path) -> None:
 
     def docker(*args: str) -> str:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise DispatchError("job timed out")
         try:
-            result = subprocess.run(
+            process = subprocess.Popen(
                 ["docker", *args],
                 env={**os.environ, "AMP_URL": os.environ.get("AMP_URL", "")},
-                capture_output=True,
-                text=True,
-                timeout=remaining,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, errors="replace", start_new_session=True,
             )
-        except subprocess.TimeoutExpired:
-            raise DispatchError("Docker command timed out; inspect the Orb before retrying") from None
         except OSError:
             raise DispatchError("Docker CLI could not start") from None
-        if result.returncode:
+        try:
+            stdout, _ = process.communicate(timeout=remaining)
+        except BaseException as error:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.communicate()
+            if isinstance(error, subprocess.TimeoutExpired):
+                raise DispatchError("Docker command timed out; inspect the Orb before retrying") from None
+            raise
+        if process.returncode:
             # Docker errors can include input values or output from the image.
-            raise DispatchError(f"Docker {args[0]} failed (exit {result.returncode})")
-        return result.stdout.strip()
+            raise DispatchError(f"Docker {args[0]} failed (exit {process.returncode})")
+        return stdout.strip()
 
     name = "palka-" + orb_id
     container_id = docker(
@@ -100,6 +155,38 @@ def main() -> None:
             raise DispatchError("container name is in use by an unowned resource")
         running = container["State"]["Running"]
 
+    pending = state / ("orb-" + orb_id + ".pending")
+
+    def transition(action: str) -> None:
+        temporary = pending.with_suffix(".next")
+        with temporary.open("w") as record:
+            json.dump({"action": action, "container": container_id}, record)
+            record.flush()
+            os.fsync(record.fileno())
+        temporary.replace(pending)
+        directory = os.open(state, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        if action == "stop":
+            docker("stop", "--time", "10", container_id)
+        else:
+            docker("start", container_id)
+        pending.unlink()
+
+    if pending.exists():
+        previous = json.loads(pending.read_text())
+        if previous.get("action") not in {"start", "stop"}:
+            raise DispatchError("local recovery record is invalid; inspect local state")
+        if container_id:
+            if previous.get("container") != container_id:
+                raise DispatchError("container changed during recovery; inspect local state")
+            transition(previous["action"])
+            running = previous["action"] == "start"
+        else:
+            pending.unlink()
+
     if operation == "spawn":
         if not container_id:
             container_id = docker(
@@ -109,10 +196,10 @@ def main() -> None:
                 "--entrypoint", "sleep", "--", image, "infinity",
             )
         if not running:
-            docker("start", container_id)
+            transition("start")
         docker("exec", "--env", "ORB_TOKEN", "--env", "AMP_URL", container_id, "bash", "-c", BOOTSTRAP)
     elif operation == "pause" and container_id and running:
-        docker("stop", "--time", "10", container_id)
+        transition("stop")
     elif operation == "delete" and container_id:
         docker("rm", "--force", "--volumes", container_id)
 
@@ -122,8 +209,16 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    def interrupted(signum, frame):
+        raise DispatchError("job interrupted; retry to check the owned resource")
+
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGINT, interrupted)
     try:
         main()
     except DispatchError as error:
         print(f"palka: {error}", file=sys.stderr)
+        sys.exit(1)
+    except (OSError, ValueError, KeyError, TypeError):
+        print("palka: runtime or local state could not be read or saved; inspect it before retrying", file=sys.stderr)
         sys.exit(1)

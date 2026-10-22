@@ -8,8 +8,9 @@ extension or dependency.
 ## Status
 
 This repository contains an initial Docker lifecycle dispatch program and
-its tests. It is not ready for a live provider. Concurrent-job recovery,
-project snapshots, resource limits, and service packaging are follow-up work.
+its tests, with concurrent-job locking and interrupted-job recovery. It is
+not ready for a live provider. Project snapshots, resource limits, and
+service packaging are follow-up work.
 There is no installer or active Orb provider.
 
 The first runtime will use Docker on Linux. Apple Containers on Apple Silicon
