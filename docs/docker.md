@@ -4,12 +4,14 @@ This is an initial implementation, not a production-ready Orb provider.
 It implements the lifecycle and recovery tasks
 [#3](https://github.com/zainfathoni/palka/issues/3) and
 [#4](https://github.com/zainfathoni/palka/issues/4), and project snapshots
-in [#5](https://github.com/zainfathoni/palka/issues/5).
+in [#5](https://github.com/zainfathoni/palka/issues/5). Local limits are in
+[#6](https://github.com/zainfathoni/palka/issues/6).
 Do not activate a live provider with this version.
 
 ## Requirements
 
-- A Linux x64 host with Python 3.11 or later and the Docker CLI and daemon.
+- A Linux x64 host with Python 3.11 or later and a local Docker CLI and daemon.
+  Linux cgroup v2 must support CPU, memory, swap, and process limits.
 - Permission to manage local Docker containers. This grants broad host access.
 - A Linux amd64/glibc image that meets the current
   [Amp image requirements](https://ampcode.com/docs/orbs/self-hosted).
@@ -116,9 +118,9 @@ Only the writable container layer is supported. Images with `VOLUME`
 declarations and containers with persistent volume or bind mounts are
 rejected, rather than silently lose that data from a snapshot. A newly
 created incompatible container can remain stopped for inspection or an
-explicit delete job. The `/tmp` tmpfs is intentionally excluded: it holds
-bootstrap credentials in memory, transient PID records, and other temporary
-files. Snapshots do not contain RAM or running processes. Store project
+explicit delete job. The `/tmp` tmpfs is intentionally excluded. It holds
+transient PID records and other temporary files. Snapshots do not contain
+RAM or running processes. Store project
 files outside `/tmp` and do not add persistent mounts manually.
 
 Palka does not write spawn credentials to the writable layer or image
@@ -158,6 +160,72 @@ diagnostics but prevents image output or Docker errors from copying input
 credentials into provider and thread logs. Investigate runtime state privately
 when a sanitized error is not enough. No environment dump is produced.
 
+## Local limits and storage admission
+
+Set all these variables for spawn and snapshot-save jobs. They have no
+production defaults. Palka validates them before a lifecycle mutation.
+Pause without a snapshot and delete remain available without these limits,
+so an invalid growth configuration cannot prevent shutdown or recovery.
+
+| Variable | Required value |
+| --- | --- |
+| `PALKA_CPUS` | Positive finite CPU count, at least one nanocpu |
+| `PALKA_MEMORY_BYTES` | Positive integer bytes, at least Docker's 6-MiB minimum |
+| `PALKA_PIDS_LIMIT` | Positive integer process limit |
+| `PALKA_MAX_RUNNING` | Positive integer running-Orb limit |
+| `PALKA_MIN_FREE_BYTES` | Positive integer filesystem reserve |
+| `PALKA_MAX_USED_BYTES` | Positive integer whole-filesystem usage ceiling |
+| `PALKA_STORAGE_PATH` | Existing absolute directory on the Docker data filesystem |
+
+Created containers get CPU, memory, and process limits. Memory plus swap is
+set to the memory limit, so the Orb has no additional swap allowance.
+The `/tmp` tmpfs size is half the memory limit, capped at 256 MiB. Tmpfs
+memory is also charged to the container memory limit. Docker's `local` log
+driver keeps two files with a nominal 5-MiB rotation size each, plus driver
+metadata and buffers. These log limits do not configure the provider journal.
+
+Resume requires the same CPU, memory, swap, process, and log configuration.
+A mismatch fails without starting or deleting the retained disk. Restore
+the approved settings; do not delete a disk as a configuration repair.
+Changing settings affects new Orbs, not existing retained disks.
+
+A short admission lock protects a slot reservation before create or start.
+Image pulls, container start, bootstrap, and snapshot work do not hold this
+global lock. Running Orbs and incomplete spawn reservations each count once.
+An interrupted or failed spawn can keep a slot until the same Orb is retried,
+paused, or deleted. This is a safe refusal, not automatic cleanup. Do not
+remove reservation files while jobs can run. All jobs must use the same
+state directory, user, daemon, and admission policy. Manual Docker changes
+are outside this coordination boundary.
+
+Storage accounting uses filesystem allocated and available bytes, not the
+sum of image virtual sizes. It therefore includes stopped disks, shared
+snapshot layers once, replaced images, build cache, logs, and unrelated files
+on that filesystem. The budget is deliberately for the whole filesystem,
+not a claim about Palka-only use. Reserve space excludes filesystem blocks
+not available to the caller. The accounting path must be on Docker's data
+filesystem. Images, snapshots, layers, and container logs must all be on
+that filesystem. Check a separate containerd image-store path locally when
+the engine uses one; split data filesystems are not supported by this budget.
+
+Spawn checks storage before admission and before start. Snapshot save checks
+before commit. A reached reserve or usage ceiling refuses new work without
+deleting data. A refused snapshot can leave the original Orb stopped with
+its disk intact. Pause and delete can still release resources.
+
+**This is admission control, not a hard writable-layer quota.** No per-Orb
+disk quota is claimed for `overlayfs` or `overlay2`. A running Orb, image
+pull, commit, or another host process can cross a threshold after its check.
+The checks do not reserve the unknown size of a future image or project.
+Use a dedicated monitored filesystem for the controlled pilot. Review host
+journal retention separately. Do not run an unattended or untrusted workload
+under this disk policy. Palka never prunes retained data to regain capacity.
+
+The proposed one-Orb, 2-CPU, 4-GiB pilot is not a default or a measured host
+capacity. Choose its process, storage, and host reserve budgets before live
+activation. Synthetic tests use smaller explicit limits; they do not measure
+an Amp workload's needs.
+
 ## Current limits
 
 - Recovery tests cover interrupted dispatch processes, not a physical host
@@ -165,8 +233,6 @@ when a sanitized error is not enough. No environment dump is produced.
   the same retained Docker storage and Palka state directory.
 - A successful spawn checks that the bootstrap process launched, not that it
   completed its Amp connection. No live Amp connection has been tested.
-- CPU, memory, process, concurrent-Orb, disk, and log budgets are not configured
-  by this version. See [task #6](https://github.com/zainfathoni/palka/issues/6).
 - No service, installer, provider registration, or macOS backend is included.
 
 ## Verification

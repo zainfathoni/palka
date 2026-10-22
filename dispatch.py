@@ -2,6 +2,7 @@
 """Handle one Amp Orb lifecycle job with the local Docker CLI."""
 
 from contextlib import contextmanager
+from dataclasses import dataclass
 import fcntl
 import hashlib
 import json
@@ -62,11 +63,89 @@ class DispatchError(Exception):
     """A safe message that can appear in provider and thread logs."""
 
 
+@dataclass(frozen=True)
+class Limits:
+    cpus: float
+    memory_bytes: int
+    pids_limit: int
+    max_running: int
+    min_free_bytes: int
+    max_used_bytes: int
+    storage_path: Path
+
+    @classmethod
+    def load(cls):
+        def positive(name):
+            key = "PALKA_" + name
+            try:
+                value = int(os.environ.get(key, ""))
+            except ValueError:
+                raise DispatchError(key + " must be a positive integer") from None
+            if value <= 0:
+                raise DispatchError(key + " must be a positive integer")
+            return value
+
+        try:
+            cpus = float(os.environ.get("PALKA_CPUS", ""))
+        except ValueError:
+            raise DispatchError("PALKA_CPUS must be a positive finite CPU count") from None
+        if not math.isfinite(cpus) or cpus < 0.000000001:
+            raise DispatchError("PALKA_CPUS must be a positive finite CPU count")
+        memory = positive("MEMORY_BYTES")
+        if memory < 6 * 1024**2:
+            raise DispatchError("PALKA_MEMORY_BYTES must be at least 6 MiB")
+        path = Path(os.environ.get("PALKA_STORAGE_PATH", ""))
+        if not path.is_absolute() or not path.is_dir():
+            raise DispatchError("PALKA_STORAGE_PATH must be an existing absolute directory")
+        return cls(cpus, memory, positive("PIDS_LIMIT"), positive("MAX_RUNNING"),
+                   positive("MIN_FREE_BYTES"), positive("MAX_USED_BYTES"), path)
+
+    def check_container(self, host):
+        if (host["NanoCpus"] != int(self.cpus * 1_000_000_000)
+                or host["Memory"] != self.memory_bytes or host["MemorySwap"] != self.memory_bytes
+                or host["PidsLimit"] != self.pids_limit
+                or host["LogConfig"] != {"Type": "local", "Config": {"max-size": "5m", "max-file": "2"}}):
+            raise DispatchError("existing Orb limits differ; restore its approved configuration before resume")
+
+    def storage(self, docker):
+        info = json.loads(docker("info", "--format", "{{json .}}"))
+        if info["OSType"] != "linux" or info["CgroupVersion"] != "2" or not all(
+            info[key] for key in ("MemoryLimit", "SwapLimit", "PidsLimit", "CpuCfsQuota")
+        ):
+            raise DispatchError("Docker requires Linux cgroup v2 with CPU, memory, swap, and PID limit support")
+        if self.storage_path.stat().st_dev != Path(info["DockerRootDir"]).stat().st_dev:
+            raise DispatchError("storage accounting path is not on the Docker data filesystem")
+        usage = os.statvfs(self.storage_path)
+        return {
+            "total_bytes": usage.f_blocks * usage.f_frsize,
+            "used_bytes": (usage.f_blocks - usage.f_bfree) * usage.f_frsize,
+            "available_bytes": usage.f_bavail * usage.f_frsize,
+            "scope": "whole-filesystem", "hard_disk_quota": False,
+        }
+
+    def check_storage(self, docker):
+        usage = self.storage(docker)
+        if usage["available_bytes"] < self.min_free_bytes:
+            raise DispatchError("storage reserve reached; no new growth admitted")
+        if usage["used_bytes"] >= self.max_used_bytes:
+            raise DispatchError("storage usage budget reached; no new growth admitted")
+
+
+def state_path() -> Path:
+    root = Path(os.environ.get("PALKA_STATE_DIR") or Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "palka")
+    if not root.is_absolute():
+        raise DispatchError("Palka state directory must be an absolute local path")
+    return root
+
+
 @contextmanager
 def lock(name: str, deadline: float):
-    root = Path(os.environ.get("PALKA_STATE_DIR") or Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "palka")
+    root = state_path()
     try:
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        info = root.stat()
+        if root.is_symlink() or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise DispatchError("Palka state directory must be private and owned by the dispatch user")
         fd = os.open(root / (name + ".lock"), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     except OSError:
         raise DispatchError("local state lock could not open") from None
@@ -101,6 +180,7 @@ def main() -> None:
         if not os.environ.get("ORB_TOKEN"):
             raise DispatchError("spawn requires ORB_TOKEN")
 
+    limits = Limits.load() if operation == "spawn" or (operation == "pause" and os.environ.get("ORB_SNAPSHOT_ID")) else None
     try:
         budget = float(os.environ.get("PALKA_JOB_TIMEOUT_SECONDS", "240"))
     except ValueError:
@@ -109,10 +189,10 @@ def main() -> None:
         raise DispatchError("PALKA_JOB_TIMEOUT_SECONDS must be greater than zero and at most 240")
     deadline = time.monotonic() + budget
     with lock("orb-" + orb_id, deadline) as state:
-        dispatch(operation, orb_id, image, deadline, state)
+        dispatch(operation, orb_id, image, deadline, state, limits)
 
 
-def dispatch(operation: str, orb_id: str, image: str, deadline: float, state: Path) -> None:
+def dispatch(operation: str, orb_id: str, image: str, deadline: float, state: Path, limits: Limits | None) -> None:
 
     def docker(*args: str) -> str:
         remaining = deadline - time.monotonic()
@@ -155,6 +235,18 @@ def dispatch(operation: str, orb_id: str, image: str, deadline: float, state: Pa
         if labels.get("dev.palka.managed") != "true" or labels.get("dev.palka.orb-id") != orb_id:
             raise DispatchError("container name is in use by an unowned resource")
         running = container["State"]["Running"]
+        if operation == "spawn":
+            limits.check_container(container["HostConfig"])
+
+    reservation = state / ("orb-" + orb_id + ".reservation")
+    if operation == "spawn":
+        with lock("admission", deadline):
+            limits.check_storage(docker)
+            occupied = set(docker("ps", "--filter", "label=dev.palka.managed=true", "--format", '{{.Label "dev.palka.orb-id"}}').splitlines())
+            occupied.update(path.name[len("orb-"):-len(".reservation")] for path in state.glob("orb-*.reservation"))
+            if orb_id not in occupied and len(occupied) >= limits.max_running:
+                raise DispatchError("running-Orb limit reached; retained disks are unchanged")
+            reservation.touch(mode=0o600)
 
     pending = state / ("orb-" + orb_id + ".pending")
 
@@ -219,12 +311,18 @@ def dispatch(operation: str, orb_id: str, image: str, deadline: float, state: Pa
             container_id = docker(
                 "create", "--init", "--platform", "linux/amd64", "--name", name,
                 "--label", "dev.palka.managed=true", "--label", "dev.palka.orb-id=" + orb_id,
-                "--tmpfs", "/tmp:rw,nosuid,nodev,mode=1777",
+                "--cpus", str(limits.cpus), "--memory", str(limits.memory_bytes),
+                "--memory-swap", str(limits.memory_bytes), "--pids-limit", str(limits.pids_limit),
+                "--log-driver", "local", "--log-opt", "max-size=5m", "--log-opt", "max-file=2",
+                "--tmpfs", "/tmp:rw,nosuid,nodev,mode=1777,size=" + str(min(limits.memory_bytes // 2, 256 * 1024**2)),
                 "--entrypoint", "sleep", "--", image, "infinity",
             )
         check_disk()
         if not running:
+            limits.check_storage(docker)
             transition("start")
+        with lock("admission", deadline):
+            reservation.unlink(missing_ok=True)
         docker("exec", "--env", "ORB_TOKEN", "--env", "AMP_URL", container_id, "bash", "-c", BOOTSTRAP)
     elif operation == "pause" and container_id:
         if snapshot_id:
@@ -233,6 +331,7 @@ def dispatch(operation: str, orb_id: str, image: str, deadline: float, state: Pa
             transition("stop")
         if snapshot_id:
             with lock("snapshot-" + digest, deadline):
+                limits.check_storage(docker)
                 snapshot_image()  # Refuse to replace an unowned tag.
                 saved_id = docker(
                     "commit", "--change", "LABEL dev.palka.snapshot=true",
@@ -242,6 +341,9 @@ def dispatch(operation: str, orb_id: str, image: str, deadline: float, state: Pa
     elif operation == "delete" and container_id:
         docker("rm", "--force", "--volumes", container_id)
 
+    if operation in {"pause", "delete"}:
+        with lock("admission", deadline):
+            reservation.unlink(missing_ok=True)
     print(f"palka: {operation} complete")
 
 

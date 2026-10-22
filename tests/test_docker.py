@@ -24,6 +24,9 @@ ROOT = Path(__file__).resolve().parent.parent
 class DockerLifecycleTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        cls.storage_path = json.loads(subprocess.check_output(
+            ["docker", "info", "--format", "{{json .DockerRootDir}}"], text=True, timeout=30,
+        ))
         cls.image = "palka-test:" + uuid.uuid4().hex
         subprocess.run(
             ["docker", "build", "--tag", cls.image, str(ROOT / "tests/fixtures")],
@@ -47,9 +50,11 @@ class DockerLifecycleTests(unittest.TestCase):
         self.addCleanup(self.remove_test_snapshots)
         self.orb_id = "test.orb_" + uuid.uuid4().hex
         self.container = "palka-" + self.orb_id
-        self.addCleanup(
-            subprocess.run,
-            ["docker", "rm", "--force", "--volumes", self.container],
+        self.addCleanup(self.remove_test_orb, self.orb_id)
+
+    def remove_test_orb(self, orb_id):
+        subprocess.run(
+            ["docker", "rm", "--force", "--volumes", "palka-" + orb_id],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=30,
@@ -70,9 +75,13 @@ class DockerLifecycleTests(unittest.TestCase):
                 self.docker("image", "rm", "--force", *set(images.splitlines()))
 
     def job_env(self, operation, token="synthetic-first-token", amp_url="https://amp.invalid", **job):
-        env = {key: value for key, value in os.environ.items() if not key.startswith("ORB_") and key != "AMP_URL"}
+        env = {key: value for key, value in os.environ.items() if not key.startswith(("ORB_", "PALKA_")) and key != "AMP_URL"}
         env.update(ORB_OPERATION=operation, ORB_ID=self.orb_id, ORB_IMAGE=self.image)
-        env["PALKA_STATE_DIR"] = self.state
+        env.update(
+            PALKA_STATE_DIR=self.state, PALKA_CPUS="0.5", PALKA_MEMORY_BYTES=str(128 * 1024**2),
+            PALKA_PIDS_LIMIT="64", PALKA_MAX_RUNNING="8", PALKA_MIN_FREE_BYTES=str(1024**2),
+            PALKA_MAX_USED_BYTES=str(2**60), PALKA_STORAGE_PATH=self.storage_path,
+        )
         env["AMP_ORB_PROVIDER_TOKEN"] = "synthetic-provider-token"
         if token is not None:
             env["ORB_TOKEN"] = token
@@ -451,6 +460,127 @@ class DockerLifecycleTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("mounted disk content", result.stderr)
         self.assertEqual(self.docker("inspect", "--format", "{{.State.Running}}", self.container), "true")
+        self.assertEqual(self.docker("exec", self.container, "cat", "/home/user/sentinel"), "sentinel")
+
+    def test_created_orb_has_operator_selected_limits(self):
+        result = self.dispatch("spawn")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        host = json.loads(self.docker("inspect", self.container))[0]["HostConfig"]
+        self.assertEqual(host["NanoCpus"], 500_000_000)
+        self.assertEqual(host["Memory"], 134_217_728)
+        self.assertEqual(host["MemorySwap"], 134_217_728)
+        self.assertEqual(host["PidsLimit"], 64)
+        self.assertEqual(host["LogConfig"], {"Type": "local", "Config": {"max-size": "5m", "max-file": "2"}})
+        self.assertEqual(self.docker("exec", self.container, "cat", "/sys/fs/cgroup/memory.max"), "134217728")
+        self.assertEqual(self.docker("exec", self.container, "cat", "/sys/fs/cgroup/pids.max"), "64")
+
+    def test_concurrent_admission_allows_only_one_running_orb(self):
+        other = self.orb_id + "-other"
+        self.addCleanup(self.remove_test_orb, other)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda orb: self.dispatch("spawn", ORB_ID=orb, PALKA_MAX_RUNNING="1"), (self.orb_id, other)))
+        self.assertEqual(sum(result.returncode == 0 for result in results), 1)
+        refused = next(result for result in results if result.returncode != 0)
+        self.assertIn("running-Orb limit", refused.stderr)
+
+    def test_storage_pressure_refuses_resume_without_losing_the_retained_disk(self):
+        self.assertEqual(self.dispatch("spawn").returncode, 0)
+        self.docker("exec", self.container, "bash", "-c", "printf sentinel > /home/user/sentinel")
+        saved_id = self.docker("inspect", "--format", "{{.Id}}", self.container)
+        self.assertEqual(self.dispatch("pause").returncode, 0)
+        for config in ({"PALKA_MIN_FREE_BYTES": str(2**60)}, {"PALKA_MAX_USED_BYTES": "1"}):
+            with self.subTest(config=config):
+                result = self.dispatch("spawn", **config)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("storage", result.stderr)
+                self.assertEqual(self.docker("inspect", "--format", "{{.State.Running}}", self.container), "false")
+                self.assertEqual(self.docker("inspect", "--format", "{{.Id}}", self.container), saved_id)
+        self.assertEqual(self.dispatch("spawn").returncode, 0)
+        self.assertEqual(self.docker("exec", self.container, "cat", "/home/user/sentinel"), "sentinel")
+
+    def test_invalid_limits_and_changed_resume_limits_do_not_change_disk_state(self):
+        for config in (
+            {"PALKA_CPUS": "synthetic-first-token"}, {"PALKA_CPUS": "nan"},
+            {"PALKA_MEMORY_BYTES": "6291455"}, {"PALKA_PIDS_LIMIT": "0"},
+            {"PALKA_MAX_RUNNING": "-1"}, {"PALKA_MIN_FREE_BYTES": "0"},
+            {"PALKA_MAX_USED_BYTES": ""}, {"PALKA_STORAGE_PATH": "relative"},
+            {"PALKA_STATE_DIR": "relative"}, {"PALKA_JOB_TIMEOUT_SECONDS": "nan"},
+        ):
+            with self.subTest(config=config):
+                result = self.dispatch("spawn", **config)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.docker("ps", "--all", "--quiet", "--filter", "name=^/" + self.container + "$"), "")
+        self.assertEqual(self.dispatch("spawn").returncode, 0)
+        self.docker("exec", self.container, "bash", "-c", "printf sentinel > /home/user/sentinel")
+        self.assertEqual(self.dispatch("pause").returncode, 0)
+        for config in ({"PALKA_CPUS": "0.25"}, {"PALKA_MEMORY_BYTES": "268435456"}, {"PALKA_PIDS_LIMIT": "32"}):
+            result = self.dispatch("spawn", **config)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("limits differ", result.stderr)
+            self.assertEqual(self.docker("inspect", "--format", "{{.State.Running}}", self.container), "false")
+        self.assertEqual(self.dispatch("spawn").returncode, 0)
+        self.assertEqual(self.docker("exec", self.container, "cat", "/home/user/sentinel"), "sentinel")
+
+    def test_capacity_denial_keeps_a_stopped_disk_and_pause_releases_the_slot(self):
+        other = self.orb_id + "-other"
+        self.addCleanup(self.remove_test_orb, other)
+        self.assertEqual(self.dispatch("spawn", PALKA_MAX_RUNNING="1").returncode, 0)
+        self.docker("exec", self.container, "bash", "-c", "printf sentinel > /home/user/sentinel")
+        saved_id = self.docker("inspect", "--format", "{{.Id}}", self.container)
+        self.assertEqual(self.dispatch("pause").returncode, 0)
+        self.assertEqual(self.dispatch("spawn", ORB_ID=other, PALKA_MAX_RUNNING="1").returncode, 0)
+        result = self.dispatch("spawn", PALKA_MAX_RUNNING="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("running-Orb limit", result.stderr)
+        self.assertEqual(self.docker("inspect", "--format", "{{.State.Running}}", self.container), "false")
+        self.assertEqual(self.dispatch("delete", ORB_ID=other).returncode, 0)
+        self.assertEqual(self.dispatch("spawn", PALKA_MAX_RUNNING="1").returncode, 0)
+        self.assertEqual(self.docker("inspect", "--format", "{{.Id}}", self.container), saved_id)
+        self.assertEqual(self.docker("exec", self.container, "cat", "/home/user/sentinel"), "sentinel")
+
+    def test_pending_spawn_reserves_capacity_until_recovery(self):
+        other = self.orb_id + "-other"
+        self.addCleanup(self.remove_test_orb, other)
+        with self.running_dispatch(self.fault_env("create", PALKA_MAX_RUNNING="1")) as process:
+            self.wait_for_barrier(self.orb_id)
+            result = self.dispatch("spawn", ORB_ID=other, PALKA_MAX_RUNNING="1")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("running-Orb limit", result.stderr)
+            process.terminate()
+            process.communicate(timeout=5)
+        self.assertEqual(self.dispatch("spawn", PALKA_MAX_RUNNING="1").returncode, 0)
+        self.record("synthetic-first-token")
+
+    def test_resource_pressure_is_contained_and_the_disk_survives(self):
+        result = self.dispatch("spawn")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # Check kernel limits before a pressure workload can allocate resources.
+        self.assertEqual(self.docker("exec", self.container, "cat", "/sys/fs/cgroup/memory.max"), "134217728")
+        self.assertEqual(self.docker("exec", self.container, "cat", "/sys/fs/cgroup/pids.max"), "64")
+        quota, period = map(int, self.docker("exec", self.container, "cat", "/sys/fs/cgroup/cpu.max").split())
+        self.assertEqual(quota * 2, period)
+        self.docker("exec", self.container, "bash", "-c", "printf sentinel > /home/user/sentinel")
+        memory = subprocess.run(
+            ["docker", "exec", self.container, "bash", "-c", 'text=x; for ((i=0; i<30; i++)); do text=$text$text; done'],
+            capture_output=True, timeout=20,
+        )
+        self.assertNotEqual(memory.returncode, 0)
+        events = dict(line.split() for line in self.docker("exec", self.container, "cat", "/sys/fs/cgroup/memory.events").splitlines())
+        self.assertGreater(int(events["oom_kill"]), 0)
+        subprocess.run(
+            ["docker", "exec", self.container, "bash", "-c", 'for i in {1..90}; do sleep 2 & done; wait'],
+            capture_output=True, timeout=20,
+        )
+        # Fork refusal can end the shell before its two-second children exit.
+        time.sleep(3)
+        events = dict(line.split() for line in self.docker("exec", self.container, "cat", "/sys/fs/cgroup/pids.events").splitlines())
+        self.assertGreater(int(events["max"]), 0)
+        before = dict(line.split() for line in self.docker("exec", self.container, "cat", "/sys/fs/cgroup/cpu.stat").splitlines())
+        self.docker("exec", self.container, "bash", "-c", 'timeout 2s yes >/dev/null || test "$?" -eq 124')
+        after = dict(line.split() for line in self.docker("exec", self.container, "cat", "/sys/fs/cgroup/cpu.stat").splitlines())
+        self.assertGreater(int(after["nr_throttled"]), int(before["nr_throttled"]))
+        self.assertEqual(self.dispatch("pause").returncode, 0)
+        self.assertEqual(self.dispatch("spawn").returncode, 0)
         self.assertEqual(self.docker("exec", self.container, "cat", "/home/user/sentinel"), "sentinel")
 
 
