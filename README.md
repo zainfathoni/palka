@@ -8,10 +8,12 @@ extension or dependency.
 ## Status
 
 This repository contains an initial Docker lifecycle dispatch program and
-its tests, with concurrent-job locking and interrupted-job recovery. It is
-not ready for a live provider. Project snapshots, resource limits, and storage
-admission checks are implemented. Service packaging is follow-up work.
-There is no installer or active Orb provider.
+its tests, with concurrent-job locking and interrupted-job recovery. Project
+snapshots, resource limits, storage admission checks, sanitized diagnostics,
+and an opt-in Linux service example are implemented. Live Amp validation is
+not run. There is no automatic installer or active Orb provider.
+Use the [controlled Linux test guide](docs/linux-pilot.md) for the next steps
+and the required operator approvals. This is not production-validated.
 
 The first runtime will use Docker on Linux. Apple Containers on Apple Silicon
 macOS is next. E2B Embed is a possible later option, not the initial stack.
@@ -31,6 +33,8 @@ tool output or model inference off Amp. See the [security guidance](SECURITY.md)
 
 - [Runtime contract and design constraints](docs/runtime-contract.md)
 - [Docker lifecycle use and limits](docs/docker.md)
+- [Linux service and diagnostics](docs/service.md)
+- [Controlled Linux test](docs/linux-pilot.md)
 - [Delivery plan](docs/roadmap.md)
 - [Domain glossary](CONTEXT.md)
 - [Contribution guide](CONTRIBUTING.md)

@@ -1,0 +1,21 @@
+[Unit]
+Description=Palka Amp Orb provider (opt-in)
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/palka/provider.env
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+WorkingDirectory=%h/.local/lib/palka
+ExecStart=%h/.local/bin/amp orb provider %h/.local/lib/palka/dispatch.py
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=270
+KillMode=control-group
+KillSignal=SIGTERM
+SendSIGKILL=yes
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=palka-provider

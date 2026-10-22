@@ -144,6 +144,46 @@ class DockerLifecycleTests(unittest.TestCase):
         self.assertEqual(self.dispatch("pause", token=None).returncode, 0)
         self.assertEqual(self.docker("ps", "--all", "--quiet", "--filter", "name=^/" + self.container + "$"), "")
 
+    def test_diagnostics_report_sanitized_results_without_mutation(self):
+        self.assertEqual(self.dispatch("spawn").returncode, 0)
+        before = {path.name: path.read_bytes() for path in Path(self.state).iterdir()}
+
+        def diagnose(**override):
+            env = self.job_env("spawn")
+            env.update(override)
+            result = subprocess.run(
+                ["python3", str(ROOT / "scripts/diagnose.py")], env=env,
+                capture_output=True, text=True, timeout=30,
+            )
+            for secret in (self.orb_id, self.state, self.storage_path, "synthetic-first-token", "synthetic-provider-token", "amp.invalid"):
+                self.assertNotIn(secret, result.stdout + result.stderr)
+            return result
+
+        result = diagnose()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertTrue(report["runtime_reachable"])
+        self.assertEqual(report["limits"]["memory_bytes"], 128 * 1024**2)
+        self.assertEqual(report["last_operations"]["spawn"]["count"], 1)
+        self.assertEqual(report["last_operations"]["spawn"]["failed"], 0)
+        self.assertGreater(report["last_operations"]["spawn"]["max_seconds"], 0)
+        self.assertEqual(before, {path.name: path.read_bytes() for path in Path(self.state).iterdir()})
+        self.assertEqual(self.docker("inspect", "--format", "{{.State.Running}}", self.container), "true")
+
+        failed = self.dispatch("spawn", PALKA_CPUS="0.75")
+        self.assertNotEqual(failed.returncode, 0)
+        report = json.loads(diagnose().stdout)
+        self.assertEqual(report["last_operations"]["spawn"]["failed"], 1)
+        bad = diagnose(DOCKER_HOST="unix:///nonexistent/synthetic-provider-token.sock")
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("Docker version failed", json.loads(bad.stdout)["error"])
+        (Path(self.state) / ("orb-" + self.orb_id + ".result")).write_text(
+            '{"operation":"synthetic-provider-token","complete":true,"seconds":1}'
+        )
+        bad = diagnose()
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("invalid", json.loads(bad.stdout)["error"])
+
     def test_repeat_spawn_replaces_only_bootstrap_and_keeps_the_running_orb(self):
         self.assertEqual(self.dispatch("spawn").returncode, 0)
         old_pid = self.record("synthetic-first-token")[3]

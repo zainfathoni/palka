@@ -4,6 +4,7 @@
 from contextlib import contextmanager
 from dataclasses import dataclass
 import fcntl
+from functools import partial
 import hashlib
 import json
 import math
@@ -187,41 +188,54 @@ def main() -> None:
         raise DispatchError("PALKA_JOB_TIMEOUT_SECONDS must be greater than zero and at most 240") from None
     if not math.isfinite(budget) or not 0 < budget <= 240:
         raise DispatchError("PALKA_JOB_TIMEOUT_SECONDS must be greater than zero and at most 240")
-    deadline = time.monotonic() + budget
+    started = time.monotonic()
+    deadline = started + budget
     with lock("orb-" + orb_id, deadline) as state:
-        dispatch(operation, orb_id, image, deadline, state, limits)
+        complete = False
+        try:
+            dispatch(operation, orb_id, image, deadline, state, limits)
+            complete = True
+        finally:
+            temporary = state / ("orb-" + orb_id + ".result.next")
+            temporary.write_text(json.dumps({
+                "operation": operation, "complete": complete,
+                "seconds": round(time.monotonic() - started, 3),
+            }) + "\n")
+            temporary.replace(state / ("orb-" + orb_id + ".result"))
+
+
+def docker_command(deadline: float, *args: str) -> str:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise DispatchError("job timed out")
+    try:
+        process = subprocess.Popen(
+            ["docker", *args],
+            env={**os.environ, "AMP_URL": os.environ.get("AMP_URL", "")},
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, errors="replace", start_new_session=True,
+        )
+    except OSError:
+        raise DispatchError("Docker CLI could not start") from None
+    try:
+        stdout, _ = process.communicate(timeout=remaining)
+    except BaseException as error:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.communicate()
+        if isinstance(error, subprocess.TimeoutExpired):
+            raise DispatchError("Docker command timed out; inspect the Orb before retrying") from None
+        raise
+    if process.returncode:
+        # Docker errors can include input values or output from the image.
+        raise DispatchError(f"Docker {args[0]} failed (exit {process.returncode})")
+    return stdout.strip()
 
 
 def dispatch(operation: str, orb_id: str, image: str, deadline: float, state: Path, limits: Limits | None) -> None:
-
-    def docker(*args: str) -> str:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise DispatchError("job timed out")
-        try:
-            process = subprocess.Popen(
-                ["docker", *args],
-                env={**os.environ, "AMP_URL": os.environ.get("AMP_URL", "")},
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, errors="replace", start_new_session=True,
-            )
-        except OSError:
-            raise DispatchError("Docker CLI could not start") from None
-        try:
-            stdout, _ = process.communicate(timeout=remaining)
-        except BaseException as error:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.communicate()
-            if isinstance(error, subprocess.TimeoutExpired):
-                raise DispatchError("Docker command timed out; inspect the Orb before retrying") from None
-            raise
-        if process.returncode:
-            # Docker errors can include input values or output from the image.
-            raise DispatchError(f"Docker {args[0]} failed (exit {process.returncode})")
-        return stdout.strip()
+    docker = partial(docker_command, deadline)
 
     name = "palka-" + orb_id
     container_id = docker(

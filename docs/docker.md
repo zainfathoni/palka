@@ -6,7 +6,7 @@ It implements the lifecycle and recovery tasks
 [#4](https://github.com/zainfathoni/palka/issues/4), and project snapshots
 in [#5](https://github.com/zainfathoni/palka/issues/5). Local limits are in
 [#6](https://github.com/zainfathoni/palka/issues/6).
-Do not activate a live provider with this version.
+Use the [Linux pilot guide](linux-pilot.md) before any approved live test.
 
 ## Requirements
 
@@ -233,7 +233,8 @@ an Amp workload's needs.
   the same retained Docker storage and Palka state directory.
 - A successful spawn checks that the bootstrap process launched, not that it
   completed its Amp connection. No live Amp connection has been tested.
-- No service, installer, provider registration, or macOS backend is included.
+- An opt-in [Linux service example and diagnostics](service.md) are included.
+  No automatic installer, provider registration, or macOS backend is included.
 
 ## Verification
 
