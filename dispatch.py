@@ -298,7 +298,7 @@ def dispatch(operation: str, orb_id: str, image: str, deadline: float, state: Pa
 
     if pending.exists():
         previous = json.loads(pending.read_text())
-        if previous.get("action") not in {"start", "stop"}:
+        if not isinstance(previous, dict) or previous.get("action") not in ("start", "stop"):
             raise DispatchError("local recovery record is invalid; inspect local state")
         if container_id:
             if previous.get("container") != container_id:

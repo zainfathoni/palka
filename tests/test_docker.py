@@ -457,6 +457,30 @@ class DockerLifecycleTests(unittest.TestCase):
         self.assertEqual(deleted.returncode, 0, deleted.stderr)
         self.assertEqual(self.docker("ps", "--all", "--quiet", "--filter", "id=" + saved_id), "")
 
+    def test_damaged_recovery_records_refuse_without_private_paths_or_disk_changes(self):
+        self.assertEqual(self.dispatch("spawn").returncode, 0)
+        self.docker("exec", self.container, "bash", "-c", "printf sentinel > /home/user/sentinel")
+        self.assertEqual(self.dispatch("pause").returncode, 0)
+        saved_id = self.docker("inspect", "--format", "{{.Id}}", self.container)
+        pending = Path(self.state) / ("orb-" + self.orb_id + ".pending")
+        for record in (None, [], {"action": []}):
+            for operation in ("spawn", "pause", "delete"):
+                with self.subTest(record=record, operation=operation):
+                    encoded = json.dumps(record)
+                    pending.write_text(encoded)
+                    result = self.dispatch(operation)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertNotIn("Traceback", result.stderr)
+                    self.assertNotIn(str(ROOT), result.stdout + result.stderr)
+                    self.assertNotIn(self.state, result.stdout + result.stderr)
+                    self.assertIn("local recovery record is invalid", result.stderr)
+                    self.assertEqual(pending.read_text(), encoded)
+                    self.assertEqual(self.docker("inspect", "--format", "{{.Id}}", self.container), saved_id)
+                    self.assertEqual(self.docker("inspect", "--format", "{{.State.Running}}", self.container), "false")
+        copied = Path(self.state) / "sentinel"
+        self.docker("cp", self.container + ":/home/user/sentinel", str(copied))
+        self.assertEqual(copied.read_text(), "sentinel")
+
     def test_snapshot_fan_out_keeps_independent_disks_and_no_spawn_credentials(self):
         snapshot_id = "test-snapshot-" + uuid.uuid4().hex
         reference = self.snapshot_ref(snapshot_id)

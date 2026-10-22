@@ -89,6 +89,51 @@ A separate stalled-CLI probe returned a sanitized failure in 240.128 seconds
 under the default 240-second job budget. It made no daemon call. This tests
 the client deadline, not cancellation of daemon work or a real cold pull.
 
+## Default Amp image checks
+
+On 2026-10-22, a local pull used this immutable Linux amd64 image:
+
+```text
+us-central1-docker.pkg.dev/amp-prod-0/amp-orb/amp-orb@sha256:e8d0d9a363a0039216eb315a1b420801ec4370bd434aa03e954f985d41b007f1
+```
+
+Its 31 layers total about 1.63 GiB compressed. The first pull of this local
+reference did not finish within 240 seconds. The test stopped the CLI at
+240.170 seconds; this does not prove that daemon work stopped. No shared
+cache was removed. A separate preparation pull used the partial cache and
+finished in another 432.624 seconds, outside any Palka job. The sampled free
+space stayed above the test's 20-GiB reserve. These samples do not identify
+the cause of the slow pull or establish a cold-start time.
+
+An offline container from the unmodified image passed checks for Linux amd64,
+the default `user` account and group, a writable home, passwordless sudo, CA
+certificates, and the required command paths. It reported glibc 2.36, Git
+2.55.0, Node.js 26.12.1, tmux 3.3a, and Amp
+`0.0.1792680509-g8973a3`. Image configuration had no VOLUME declarations or
+nonempty `ORB_TOKEN`, `AMP_URL`, or `AMP_ORB_PROVIDER_TOKEN` variables. This
+was not a scan of all files for secrets. Network access was disabled for
+this check. Real `amp --version` ran; real bootstrap did not run.
+
+Two additional public-dispatch tests passed on a disposable derivative of
+that image. Only the Amp executable was replaced with the synthetic fixture;
+the image's default user was preserved. They checked retained-disk resume,
+fresh synthetic credentials, snapshot restore into an independent disk,
+redacted output, and scoped deletion. Their combined test time was 101.402
+seconds, including the fixture build. This is not a lifecycle benchmark or
+a real Amp connection. The derivative, test containers, and test snapshots
+were removed; the public base image remains cached.
+
+The complete small-fixture and service suite also passed: 33 tests in
+174.813 seconds. It includes refusal of damaged recovery records without a
+traceback, private paths, or disk changes. The two suites ran during the
+same interval; do not compare their elapsed times as performance samples.
+
+Use a pre-pulled, approved image for the first live pilot. Do not claim cold
+default-image spawn support from these results. Image preparation needs its
+own time and storage budget; it must not extend a dispatch job's deadline.
+Before approved activation, set the provider's `ORB_IMAGE` override to the
+same immutable reference. A recorded digest alone does not pin later jobs.
+
 ## Before a live test
 
 - [ ] Approve the exact local revision for use. Publication is a separate action.
@@ -103,7 +148,8 @@ the client deadline, not cancellation of daemon work or a real cold pull.
 - [ ] Inspect the current upstream default image and record its immutable digest.
   Test a real cold pull and launch against the job deadline, or pre-pull the
   approved image and record that the pilot uses cached images. Do not delete
-  shared cache to manufacture a cold pull. Cold default-image pull is **not run**.
+  shared cache to manufacture a cold pull. The recorded first pull exceeded
+  the budget; cold default-image spawn is **not verified**.
 - [ ] Verify the chosen image has the required glibc, tools, default user, writable
   home, and no unsupported VOLUME declarations or baked credentials. Review
   project setup for secrets written to snapshot content.
