@@ -414,6 +414,25 @@ class DockerLifecycleTests(unittest.TestCase):
         self.docker("cp", self.container + ":/home/user/sentinel", str(copied))
         self.assertEqual(copied.read_text(), "sentinel")
 
+    def test_reported_stop_failure_still_requires_quiescence(self):
+        self.assertEqual(self.dispatch("spawn").returncode, 0)
+        self.docker("exec", self.container, "bash", "-c", "printf sentinel > /home/user/sentinel")
+        result = subprocess.run(
+            [str(ROOT / "dispatch.py")],
+            env=self.fault_env("stop", ORB_OPERATION="pause", PALKA_TEST_DAEMON_ERROR="1"),
+            capture_output=True, text=True, timeout=20,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Docker stop failed", result.stderr)
+        self.assertNotIn("synthetic-first-token", result.stdout + result.stderr)
+        refused = self.dispatch("spawn")
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("uncertain", refused.stderr)
+        self.assertEqual(self.docker("inspect", "--format", "{{.State.Running}}", self.container), "false")
+        copied = Path(self.state) / "sentinel"
+        self.docker("cp", self.container + ":/home/user/sentinel", str(copied))
+        self.assertEqual(copied.read_text(), "sentinel")
+
     def test_unknown_start_refuses_pause_but_allows_scoped_delete(self):
         result = subprocess.run(
             [str(ROOT / "dispatch.py")], env=self.fault_env("start", PALKA_TEST_FAIL="1"),

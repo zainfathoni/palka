@@ -44,8 +44,8 @@ starting it. See the [Docker limits](docker.md#local-limits-and-storage-admissio
 
 Uncertain Docker transitions can stop automatic recovery. Dispatch refuses
 pause or resume rather than replay a request whose daemon outcome is unknown.
-A confirmed Engine failure does not block a later pause or approved delete.
-An unknown stop can need an approved host reboot or another verified drain
+A confirmed Engine start failure does not block a later pause or approved
+delete. Any failed or unknown stop can need an approved host reboot or another verified drain
 before safe resume; a provider restart alone is not enough. See the
 [quiescence procedure](docker.md#concurrency-and-recovery). This limits the
 initial pilot to monitored operation, not unattended availability.

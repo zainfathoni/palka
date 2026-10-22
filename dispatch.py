@@ -291,7 +291,7 @@ def dispatch(operation: str, orb_id: str, image: str, deadline: float, state: Pa
             else:
                 docker("start", container_id)
         except DockerFailure as error:
-            if error.daemon_response:
+            if error.daemon_response and action == "start":
                 pending.unlink()
             raise
         pending.unlink()

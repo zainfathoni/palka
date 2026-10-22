@@ -15,7 +15,8 @@ It does not depend on a shell or a login PATH to find Amp.
 ## Prepare and install (no activation)
 
 Use a Linux x64 host with Python 3.11 or later, a user systemd manager,
-and a working Docker CLI and daemon. Use one dedicated account for all
+and a working Docker CLI and daemon through the local Unix socket. Do not
+use a proxy or remote Docker endpoint or context. Use one dedicated account for all
 dispatch jobs against that daemon. Docker access grants broad host control;
 this service is not a hostile-tenant security boundary. Do not run it as root.
 

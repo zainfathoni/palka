@@ -16,6 +16,9 @@ if os.environ.get("PALKA_TEST_FAIL"):
     sys.exit(7)
 result = subprocess.run(command)
 if result.returncode == 0:
+    if os.environ.get("PALKA_TEST_DAEMON_ERROR"):
+        print("Error response from daemon: " + os.environ["ORB_TOKEN"], file=sys.stderr)
+        sys.exit(1)
     barrier = Path(os.environ["PALKA_TEST_BARRIER"])
     (barrier / os.environ["ORB_ID"]).touch()
     while not (barrier / "release").exists():

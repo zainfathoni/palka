@@ -12,6 +12,8 @@ Use the [Linux pilot guide](linux-pilot.md) before any approved live test.
 
 - A Linux x64 host with Python 3.11 or later and a local Docker CLI and daemon.
   Linux cgroup v2 must support CPU, memory, swap, and process limits.
+  The CLI must use the local Unix socket, not a proxy, remote `DOCKER_HOST`,
+  or remote context. The Engine error classification depends on this boundary.
 - Permission to manage local Docker containers. This grants broad host access.
 - A Linux amd64/glibc image that meets the current
   [Amp image requirements](https://ampcode.com/docs/orbs/self-hosted).
@@ -75,8 +77,10 @@ labels find retained containers after a provider or host restart.
 
 Before start or stop, Palka saves a recovery record with the immutable
 container ID and operation. A successful CLI response resolves the record.
-An explicit `Error response from daemon:` also resolves that request, but
-the job still fails. The raw error is never logged. An unrecognized error,
+For start only, an explicit `Error response from daemon:` also resolves the
+request, but the job still fails. A failed stop stays uncertain: a signal
+already sent can still take effect after the error. The raw error is never
+logged. An unrecognized error,
 lost connection, timeout, or interrupted client leaves the outcome uncertain.
 A changed container ID or damaged record requires inspection.
 
