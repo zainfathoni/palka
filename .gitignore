@@ -1,0 +1,19 @@
+# Local runtime state and credentials
+/.palka/
+/state/
+/snapshots/
+/logs/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.log
+
+# Local development output
+__pycache__/
+*.py[cod]
+.venv/
+/dist/
+/coverage/
+.DS_Store
