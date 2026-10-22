@@ -1,12 +1,16 @@
 """Exercise the dispatch contract against disposable real Docker containers."""
 
 from contextlib import contextmanager
+import gzip
+import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import shutil
 import signal
 import subprocess
+import tarfile
 import tempfile
 import time
 import unittest
@@ -39,6 +43,8 @@ class DockerLifecycleTests(unittest.TestCase):
         state = tempfile.TemporaryDirectory(prefix="palka-test-state-")
         self.addCleanup(state.cleanup)
         self.state = state.name
+        self.snapshot_ids = []
+        self.addCleanup(self.remove_test_snapshots)
         self.orb_id = "test.orb_" + uuid.uuid4().hex
         self.container = "palka-" + self.orb_id
         self.addCleanup(
@@ -51,6 +57,17 @@ class DockerLifecycleTests(unittest.TestCase):
 
     def docker(self, *args):
         return subprocess.check_output(["docker", *args], text=True, timeout=30).strip()
+
+    def snapshot_ref(self, snapshot_id):
+        self.snapshot_ids.append(snapshot_id)
+        return "palka-snapshot:" + hashlib.sha256(snapshot_id.encode()).hexdigest()
+
+    def remove_test_snapshots(self):
+        for snapshot_id in set(self.snapshot_ids):
+            digest = hashlib.sha256(snapshot_id.encode()).hexdigest()
+            images = self.docker("image", "ls", "--all", "--quiet", "--filter", "label=dev.palka.snapshot-id=" + digest)
+            if images:
+                self.docker("image", "rm", "--force", *set(images.splitlines()))
 
     def job_env(self, operation, token="synthetic-first-token", amp_url="https://amp.invalid", **job):
         env = {key: value for key, value in os.environ.items() if not key.startswith("ORB_") and key != "AMP_URL"}
@@ -93,7 +110,6 @@ class DockerLifecycleTests(unittest.TestCase):
     def test_disk_survives_pause_and_resume_with_current_credentials(self):
         result = self.dispatch("spawn", ORB_SNAPSHOT_ID="synthetic-snapshot")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("snapshots are not supported", result.stderr)
         first = self.record("synthetic-first-token")
         self.assertEqual(first[:3], ["user", "synthetic-first-token", "https://amp.invalid"])
         container_id = self.docker("inspect", "--format", "{{.Id}}", self.container)
@@ -320,6 +336,120 @@ class DockerLifecycleTests(unittest.TestCase):
         result = self.dispatch("spawn")
         self.assertEqual(result.returncode, 0, result.stderr)
         time.sleep(11)
+        self.assertEqual(self.docker("inspect", "--format", "{{.State.Running}}", self.container), "true")
+        self.assertEqual(self.docker("exec", self.container, "cat", "/home/user/sentinel"), "sentinel")
+
+    def test_snapshot_fan_out_keeps_independent_disks_and_no_spawn_credentials(self):
+        snapshot_id = "test-snapshot-" + uuid.uuid4().hex
+        reference = self.snapshot_ref(snapshot_id)
+        self.assertEqual(self.dispatch("spawn").returncode, 0)
+        self.record("synthetic-first-token")
+        original = self.docker("inspect", "--format", "{{.Id}}", self.container)
+        self.docker("exec", self.container, "bash", "-c", "printf prepared > /home/user/sentinel")
+        result = self.dispatch("pause", ORB_SNAPSHOT_ID=snapshot_id)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.docker("image", "inspect", reference)
+        self.assertEqual(self.dispatch("spawn", ORB_SNAPSHOT_ID=snapshot_id).returncode, 0)
+        self.assertEqual(self.docker("inspect", "--format", "{{.Id}}", self.container), original)
+        self.docker("exec", self.container, "bash", "-c", "printf original > /home/user/sentinel")
+
+        copies = [self.orb_id + "-a", self.orb_id + "-b"]
+        for orb_id in copies:
+            self.addCleanup(self.docker, "rm", "--force", "--volumes", "palka-" + orb_id)
+            result = self.dispatch("spawn", token="synthetic-copy-token", amp_url=None, ORB_ID=orb_id, ORB_SNAPSHOT_ID=snapshot_id)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(self.docker("exec", "palka-" + orb_id, "cat", "/home/user/sentinel"), "prepared")
+            record = self.docker("exec", "palka-" + orb_id, "cat", "/tmp/bootstrap-record").splitlines()
+            self.assertEqual(record[:3], ["user", "synthetic-copy-token", ""])
+        self.docker("exec", "palka-" + copies[0], "bash", "-c", "printf changed > /home/user/sentinel")
+        self.assertEqual(self.dispatch("delete", ORB_ID=copies[0]).returncode, 0)
+        self.assertEqual(self.docker("exec", "palka-" + copies[1], "cat", "/home/user/sentinel"), "prepared")
+        self.assertEqual(self.docker("exec", self.container, "cat", "/home/user/sentinel"), "original")
+        self.assertEqual(self.dispatch("spawn", ORB_ID=copies[0], ORB_SNAPSHOT_ID=snapshot_id).returncode, 0)
+        self.assertEqual(self.docker("exec", "palka-" + copies[0], "cat", "/home/user/sentinel"), "prepared")
+        archive = subprocess.check_output(["docker", "image", "save", reference], timeout=60)
+        with tarfile.open(fileobj=io.BytesIO(archive)) as saved:
+            for entry in saved:
+                if not entry.isfile():
+                    continue
+                payload = saved.extractfile(entry).read()
+                if payload.startswith(b"\x1f\x8b"):
+                    payload = gzip.decompress(payload)
+                self.assertFalse(payload.startswith(b"\x28\xb5\x2f\xfd"), "Snapshot test needs a zstd layer decoder.")
+                for marker in (b"synthetic-first-token", b"synthetic-copy-token", b"synthetic-provider-token"):
+                    self.assertFalse(marker in payload, "Snapshot contains a synthetic credential marker.")
+
+    def test_interrupted_snapshot_keeps_the_prior_copy_and_serializes_readers(self):
+        snapshot_id = "test-snapshot-" + uuid.uuid4().hex
+        reference = self.snapshot_ref(snapshot_id)
+        self.assertEqual(self.dispatch("spawn").returncode, 0)
+        self.docker("exec", self.container, "bash", "-c", "printf old > /home/user/sentinel")
+        self.assertEqual(self.dispatch("pause", ORB_SNAPSHOT_ID=snapshot_id).returncode, 0)
+        old_image = self.docker("image", "inspect", "--format", "{{.Id}}", reference)
+        self.assertEqual(self.dispatch("spawn").returncode, 0)
+        self.docker("exec", self.container, "bash", "-c", "printf new > /home/user/sentinel")
+        reader = self.orb_id + "-reader"
+        self.addCleanup(self.docker, "rm", "--force", "palka-" + reader)
+        env = self.fault_env("commit", ORB_OPERATION="pause", ORB_SNAPSHOT_ID=snapshot_id)
+        with self.running_dispatch(env) as process:
+            self.wait_for_barrier(self.orb_id)
+            self.assertEqual(self.docker("image", "inspect", "--format", "{{.Id}}", reference), old_image)
+            result = self.dispatch("spawn", ORB_ID=reader, ORB_SNAPSHOT_ID=snapshot_id, PALKA_JOB_TIMEOUT_SECONDS="0.4")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("timed out waiting", result.stderr)
+            process.terminate()
+            process.communicate(timeout=5)
+        self.assertEqual(self.dispatch("spawn", ORB_ID=reader, ORB_SNAPSHOT_ID=snapshot_id).returncode, 0)
+        self.assertEqual(self.docker("exec", "palka-" + reader, "cat", "/home/user/sentinel"), "old")
+        self.assertEqual(self.dispatch("pause", ORB_SNAPSHOT_ID=snapshot_id).returncode, 0)
+        self.assertNotEqual(self.docker("image", "inspect", "--format", "{{.Id}}", reference), old_image)
+        self.assertEqual(self.docker("exec", "palka-" + reader, "cat", "/home/user/sentinel"), "old")
+
+    def test_snapshot_writers_publish_one_complete_disk(self):
+        snapshot_id = "test-snapshot-" + uuid.uuid4().hex
+        self.snapshot_ref(snapshot_id)
+        other = self.orb_id + "-writer"
+        reader = self.orb_id + "-reader"
+        for orb_id in (other, reader):
+            self.addCleanup(self.docker, "rm", "--force", "palka-" + orb_id)
+        for orb_id, value in ((self.orb_id, "first-writer"), (other, "second-writer")):
+            self.assertEqual(self.dispatch("spawn", ORB_ID=orb_id).returncode, 0)
+            self.docker("exec", "palka-" + orb_id, "bash", "-c", 'printf %s "$1" > /home/user/sentinel', "_", value)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda orb_id: self.dispatch("pause", ORB_ID=orb_id, ORB_SNAPSHOT_ID=snapshot_id), (self.orb_id, other)))
+        for result in results:
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.dispatch("spawn", ORB_ID=reader, ORB_SNAPSHOT_ID=snapshot_id).returncode, 0)
+        self.assertIn(self.docker("exec", "palka-" + reader, "cat", "/home/user/sentinel"), {"first-writer", "second-writer"})
+
+    def test_snapshot_errors_do_not_fall_back_to_the_base_image(self):
+        snapshot_id = "test-snapshot-" + uuid.uuid4().hex
+        reference = self.snapshot_ref(snapshot_id)
+        self.docker("image", "tag", self.image, reference)
+        self.addCleanup(self.docker, "image", "rm", reference)
+        result = self.dispatch("spawn", ORB_SNAPSHOT_ID=snapshot_id)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unowned resource", result.stderr)
+        env = self.fault_env("image inspect", ORB_SNAPSHOT_ID=snapshot_id, PALKA_TEST_FAIL="1")
+        with self.running_dispatch(env) as process:
+            stdout, stderr = process.communicate(timeout=5)
+        self.assertNotEqual(process.returncode, 0)
+        self.assertIn("Docker image failed", stderr)
+        self.assertNotIn("synthetic-first-token", stdout + stderr)
+        self.assertEqual(self.docker("ps", "--all", "--quiet", "--filter", "name=^/" + self.container + "$"), "")
+
+    def test_mounted_volume_data_is_rejected_instead_of_omitted_from_a_snapshot(self):
+        snapshot_id = "test-snapshot-" + uuid.uuid4().hex
+        self.snapshot_ref(snapshot_id)
+        self.docker(
+            "run", "--detach", "--name", self.container, "--volume", "/home/user",
+            "--label", "dev.palka.managed=true", "--label", "dev.palka.orb-id=" + self.orb_id,
+            self.image, "sleep", "infinity",
+        )
+        self.docker("exec", self.container, "bash", "-c", "printf sentinel > /home/user/sentinel")
+        result = self.dispatch("pause", ORB_SNAPSHOT_ID=snapshot_id)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("mounted disk content", result.stderr)
         self.assertEqual(self.docker("inspect", "--format", "{{.State.Running}}", self.container), "true")
         self.assertEqual(self.docker("exec", self.container, "cat", "/home/user/sentinel"), "sentinel")
 

@@ -3,6 +3,7 @@
 
 from contextlib import contextmanager
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -187,24 +188,60 @@ def dispatch(operation: str, orb_id: str, image: str, deadline: float, state: Pa
         else:
             pending.unlink()
 
+    snapshot_id = os.environ.get("ORB_SNAPSHOT_ID", "")
+    digest = hashlib.sha256(snapshot_id.encode()).hexdigest()
+    reference = "palka-snapshot:" + digest
+
+    def snapshot_image() -> str:
+        found = docker("image", "ls", "--no-trunc", "--quiet", "--filter", "reference=" + reference)
+        if not found:
+            return ""
+        saved = json.loads(docker("image", "inspect", reference))[0]
+        labels = saved["Config"].get("Labels") or {}
+        if labels.get("dev.palka.snapshot") != "true" or labels.get("dev.palka.snapshot-id") != digest:
+            raise DispatchError("snapshot name is in use by an unowned resource")
+        return saved["Id"]
+
+    def check_disk() -> None:
+        current = json.loads(docker("inspect", container_id))[0]
+        if current["Config"].get("Volumes") or any(mount["Type"] != "tmpfs" for mount in current["Mounts"]):
+            raise DispatchError("mounted disk content is not supported; use an image without VOLUME declarations")
+        for value in current["Config"].get("Env") or []:
+            key, _, secret = value.partition("=")
+            if key in {"ORB_TOKEN", "AMP_ORB_PROVIDER_TOKEN"} and secret:
+                raise DispatchError("image configuration contains a credential; use a clean base image")
+
     if operation == "spawn":
         if not container_id:
+            if snapshot_id:
+                with lock("snapshot-" + digest, deadline):
+                    image = snapshot_image() or image
             container_id = docker(
                 "create", "--init", "--platform", "linux/amd64", "--name", name,
                 "--label", "dev.palka.managed=true", "--label", "dev.palka.orb-id=" + orb_id,
                 "--tmpfs", "/tmp:rw,nosuid,nodev,mode=1777",
                 "--entrypoint", "sleep", "--", image, "infinity",
             )
+        check_disk()
         if not running:
             transition("start")
         docker("exec", "--env", "ORB_TOKEN", "--env", "AMP_URL", container_id, "bash", "-c", BOOTSTRAP)
-    elif operation == "pause" and container_id and running:
-        transition("stop")
+    elif operation == "pause" and container_id:
+        if snapshot_id:
+            check_disk()
+        if running:
+            transition("stop")
+        if snapshot_id:
+            with lock("snapshot-" + digest, deadline):
+                snapshot_image()  # Refuse to replace an unowned tag.
+                saved_id = docker(
+                    "commit", "--change", "LABEL dev.palka.snapshot=true",
+                    "--change", "LABEL dev.palka.snapshot-id=" + digest, container_id,
+                )
+                docker("image", "tag", saved_id, reference)
     elif operation == "delete" and container_id:
         docker("rm", "--force", "--volumes", container_id)
 
-    if os.environ.get("ORB_SNAPSHOT_ID") and operation in {"spawn", "pause"}:
-        print("palka: project snapshots are not supported in this version", file=sys.stderr)
     print(f"palka: {operation} complete")
 
 

@@ -8,8 +8,12 @@ import sys
 import time
 
 command = [os.environ["PALKA_TEST_DOCKER"], *sys.argv[1:]]
-if sys.argv[1] != os.environ["PALKA_TEST_STAGE"]:
+stage = os.environ["PALKA_TEST_STAGE"].split()
+if sys.argv[1:1 + len(stage)] != stage:
     os.execv(command[0], command)
+if os.environ.get("PALKA_TEST_FAIL"):
+    print(os.environ["ORB_TOKEN"], file=sys.stderr)
+    sys.exit(7)
 result = subprocess.run(command)
 if result.returncode == 0:
     barrier = Path(os.environ["PALKA_TEST_BARRIER"])

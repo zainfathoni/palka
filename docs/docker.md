@@ -3,7 +3,8 @@
 This is an initial implementation, not a production-ready Orb provider.
 It implements the lifecycle and recovery tasks
 [#3](https://github.com/zainfathoni/palka/issues/3) and
-[#4](https://github.com/zainfathoni/palka/issues/4).
+[#4](https://github.com/zainfathoni/palka/issues/4), and project snapshots
+in [#5](https://github.com/zainfathoni/palka/issues/5).
 Do not activate a live provider with this version.
 
 ## Requirements
@@ -89,6 +90,60 @@ process group and returns a sanitized error. It cannot guarantee that the
 Docker daemon cancelled work. Retry through dispatch to recover a pending
 transition, rather than run conflicting manual Docker commands.
 
+## Project snapshots
+
+Pause with `ORB_SNAPSHOT_ID` stops the Orb, then commits its writable layer
+to a separate local image. The retained Orb container stays in place. A
+later spawn of that same Orb uses its retained disk, not the snapshot. A new
+Orb uses an independent writable layer on the saved image. Deleting one Orb
+does not remove a shared snapshot.
+
+Snapshot IDs are opaque strings. Palka uses the SHA-256 digest of their UTF-8
+bytes as the tag in `palka-snapshot:<digest>`. The image must have both
+`dev.palka.snapshot=true` and `dev.palka.snapshot-id=<digest>`. A tag collision
+with an unowned image is an error, not a cache miss. A successful local image
+list with no such tag is a miss and uses `ORB_IMAGE`; an inspect or daemon
+failure is an error. No registry is used to store or retrieve these snapshots.
+
+Writers and readers take the same snapshot lock after the Orb lock. A writer
+first creates a complete immutable image, then publishes its tag. Readers
+cannot see a partial commit. Successful writers for the same ID run in lock
+order; the last successful publication wins. A failure before publication
+keeps the prior tag. A completed but unpublished commit can leave an untagged
+owned image. Snapshot work uses the same job deadline.
+
+Only the writable container layer is supported. Images with `VOLUME`
+declarations and containers with persistent volume or bind mounts are
+rejected, rather than silently lose that data from a snapshot. A newly
+created incompatible container can remain stopped for inspection or an
+explicit delete job. The `/tmp` tmpfs is intentionally excluded: it holds
+bootstrap credentials in memory, transient PID records, and other temporary
+files. Snapshots do not contain RAM or running processes. Store project
+files outside `/tmp` and do not add persistent mounts manually.
+
+Palka does not write spawn credentials to the writable layer or image
+configuration. It rejects nonempty `ORB_TOKEN` or `AMP_ORB_PROVIDER_TOKEN`
+values in container image configuration. This is not a general secret
+scanner. Project files and tools can write their own secrets to disk; such
+files would enter the snapshot. Use trusted project setup and inspect its
+secret handling before snapshot reuse or sharing.
+
+Snapshots have no automatic expiry or deletion. Replaced and unpublished
+images can also consume disk. Count them in storage budgets. Amp snapshot
+invalidation does not itself remove a local Docker image under this dispatch
+contract. Cleanup is a separate operator action, never an uninstall or Orb
+delete side effect. Stop the provider and exclude direct dispatch jobs
+before an approved cleanup. List candidates with:
+
+```sh
+docker image ls --all --no-trunc --filter label=dev.palka.snapshot=true
+```
+
+Verify the exact image ID, ownership labels, tags, and current users locally.
+Remove only the approved reference or immutable image ID with `docker image
+rm`; do not use force or a general prune command. Keep images still used by
+retained Orbs or desired snapshots. This guide does not authorize deletion.
+
 ## Credentials and output
 
 Spawn credentials enter only the bootstrap exec environment, not container
@@ -110,9 +165,6 @@ when a sanitized error is not enough. No environment dump is produced.
   the same retained Docker storage and Palka state directory.
 - A successful spawn checks that the bootstrap process launched, not that it
   completed its Amp connection. No live Amp connection has been tested.
-- `ORB_SNAPSHOT_ID` is accepted but not used. Spawn uses the retained disk or
-  base image, and pause does not save a project snapshot. A warning states
-  this limit. Snapshot support is [task #5](https://github.com/zainfathoni/palka/issues/5).
 - CPU, memory, process, concurrent-Orb, disk, and log budgets are not configured
   by this version. See [task #6](https://github.com/zainfathoni/palka/issues/6).
 - No service, installer, provider registration, or macOS backend is included.
