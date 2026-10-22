@@ -48,11 +48,13 @@ def report():
         summaries = {}
         result["last_operations"] = summaries
         result["spawn_reservations"] = 0
+        result["unresolved_transitions"] = 0
         if root.exists():
             info = root.stat()
             if root.is_symlink() or info.st_uid != os.getuid() or info.st_mode & 0o077:
                 raise DispatchError("Palka state directory must be private and owned by the dispatch user")
             result["spawn_reservations"] = len(list(root.glob("orb-*.reservation")))
+            result["unresolved_transitions"] = len(list(root.glob("orb-*.pending")))
             for path in root.glob("orb-*.result"):
                 record = json.loads(path.read_text())
                 operation = record["operation"]

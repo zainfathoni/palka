@@ -74,11 +74,31 @@ releases a lock when its dispatch process exits. Docker names and ownership
 labels find retained containers after a provider or host restart.
 
 Before start or stop, Palka saves a recovery record with the immutable
-container ID and operation. The next job finishes that transition before it
-handles new work. This prevents a pending Docker stop from later stopping a
-resumed Orb. A changed container ID or damaged record requires inspection;
-Palka does not guess or delete retained disks to repair it. Do not discard
-recovery records during an upgrade or service removal.
+container ID and operation. A successful CLI response resolves the record.
+An explicit `Error response from daemon:` also resolves that request, but
+the job still fails. The raw error is never logged. An unrecognized error,
+lost connection, timeout, or interrupted client leaves the outcome uncertain.
+A changed container ID or damaged record requires inspection.
+
+A pending start can be resolved when the locked inspect observes its running
+state. Otherwise, pause and spawn refuse an uncertain transition. In
+particular, Palka does not replay an uncertain stop and then resume: another
+stop request is not a completion fence for the first request. This is a
+deliberate loss of automatic recovery, not a claim that the daemon cancelled
+work. An approved delete can still remove the owned immutable container ID;
+it does not replay a failing start. A failed removal preserves the record.
+Do not discard recovery records during an upgrade or service removal.
+
+To recover an uncertain transition without deleting a disk, stop the provider
+and exclude all direct dispatch jobs. Obtain separate approval for a host
+reboot or another verified procedure that drains old Docker and runtime
+requests. This can affect other containers and is not authorized by a job
+retry. A daemon restart, inspect result, or time delay alone is not proof
+that all runtime work has ended.
+After the old daemon requests cannot run, inspect the exact recorded ID and
+ownership labels. Archive only that reviewed pending record outside its
+active `.pending` name, then retry dispatch with the same limits and state.
+Preserve the disk, lock files, and reservation. Do not clear all state.
 
 Bootstrap launch also has an in-container lock. The child saves its PID and
 start time before it runs `amp`, then closes its copy of the lock. A Docker
@@ -90,7 +110,8 @@ Each job has one 240-second deadline, including lock waits. Set
 240 to use a shorter budget. Timeout or termination kills the Docker client
 process group and returns a sanitized error. It cannot guarantee that the
 Docker daemon cancelled work. Retry through dispatch to recover a pending
-transition, rather than run conflicting manual Docker commands.
+transition, or follow the quiescence procedure if the retry refuses it.
+Do not run conflicting manual Docker commands while jobs can run.
 
 ## Project snapshots
 
@@ -256,8 +277,9 @@ The suite checks disk retention, default-user bootstrap, fresh credentials,
 repeat and concurrent operations, unrelated resources, ownership collisions,
 invalid input, failed image creation, an unreachable daemon, lock deadlines,
 and interruption after create, start, exec, stop, and removal. It also
-interrupts a slow stop before it completes and checks that a resumed Orb
-stays running. Concurrent spawn/pause can finish running or stopped, but
+interrupts a slow stop before it completes and checks that resume refuses
+the uncertain transition while the disk stays intact. Concurrent spawn/pause
+can finish running or stopped, but
 must keep the same sentinel disk. Concurrent spawn/delete can finish running
 on a new disk or absent; the deleted disk must not return. It removes its own
 containers and image tag. It does not prune Docker's shared build cache or

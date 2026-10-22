@@ -324,7 +324,7 @@ class DockerLifecycleTests(unittest.TestCase):
                     self.assertNotIn("synthetic-first-token", stdout + stderr)
 
     def test_interrupted_jobs_recover_from_docker_state(self):
-        for stage, operation in (("create", "spawn"), ("start", "spawn"), ("exec", "spawn"), ("stop", "pause"), ("rm", "delete")):
+        for stage, operation in (("create", "spawn"), ("start", "spawn"), ("exec", "spawn"), ("rm", "delete")):
             with self.subTest(stage=stage):
                 self.assertEqual(self.dispatch("delete").returncode, 0)
                 if operation != "spawn":
@@ -346,8 +346,6 @@ class DockerLifecycleTests(unittest.TestCase):
                 self.record("synthetic-retry-token")
                 if operation != "delete":
                     self.assertEqual(self.docker("inspect", "--format", "{{.Id}}", self.container), saved_id)
-                if operation == "pause":
-                    self.assertEqual(self.docker("exec", self.container, "cat", "/home/user/sentinel"), "sentinel")
                 processes = self.docker("top", self.container, "-eo", "pid,args").splitlines()
                 self.assertEqual(sum(line.split(maxsplit=1)[-1] == "sleep infinity" for line in processes), 2)
 
@@ -369,7 +367,31 @@ class DockerLifecycleTests(unittest.TestCase):
                     self.assertNotEqual(self.docker("inspect", "--format", "{{.Id}}", self.container), saved_id)
                     self.docker("exec", self.container, "test", "!", "-e", "/home/user/sentinel")
 
-    def test_resume_waits_for_an_interrupted_stop_that_is_still_in_progress(self):
+    def test_failed_start_does_not_prevent_pause_or_delete(self):
+        for pause_first in (False, True):
+            with self.subTest(pause_first=pause_first):
+                self.assertEqual(self.dispatch("spawn").returncode, 0)
+                self.docker("exec", self.container, "bash", "-c", "printf retained > /home/user/sentinel")
+                saved_id = self.docker("inspect", "--format", "{{.Id}}", self.container)
+                # Break only this disposable container's configured user, not its image.
+                self.docker("exec", "--user", "0", self.container, "sed", "-i", "/^user:/d", "/etc/passwd")
+                self.assertEqual(self.dispatch("pause").returncode, 0)
+                failed = self.dispatch("spawn")
+                self.assertNotEqual(failed.returncode, 0)
+                self.assertIn("Docker start failed", failed.stderr)
+                if pause_first:
+                    paused = self.dispatch("pause")
+                    self.assertEqual(paused.returncode, 0, paused.stderr)
+                    self.assertEqual(self.docker("inspect", "--format", "{{.State.Running}}", self.container), "false")
+                    copied = Path(self.state) / "sentinel"
+                    self.docker("cp", self.container + ":/home/user/sentinel", str(copied))
+                    self.assertEqual(copied.read_text(), "retained")
+                    self.assertNotEqual(self.dispatch("spawn").returncode, 0)
+                deleted = self.dispatch("delete")
+                self.assertEqual(deleted.returncode, 0, deleted.stderr)
+                self.assertEqual(self.docker("ps", "--all", "--quiet", "--filter", "id=" + saved_id), "")
+
+    def test_resume_refuses_an_unknown_stop_and_preserves_the_disk(self):
         self.assertEqual(self.dispatch("spawn").returncode, 0)
         self.docker("exec", self.container, "bash", "-c", "printf sentinel > /home/user/sentinel")
         self.docker("exec", self.container, "bash", "-c", 'read -r child rest < /proc/1/task/1/children; kill -STOP "$child"')
@@ -383,10 +405,38 @@ class DockerLifecycleTests(unittest.TestCase):
             process.terminate()
             process.communicate(timeout=5)
         result = self.dispatch("spawn")
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("uncertain", result.stderr)
         time.sleep(11)
-        self.assertEqual(self.docker("inspect", "--format", "{{.State.Running}}", self.container), "true")
-        self.assertEqual(self.docker("exec", self.container, "cat", "/home/user/sentinel"), "sentinel")
+        self.assertNotEqual(self.dispatch("spawn").returncode, 0)
+        self.assertEqual(self.docker("inspect", "--format", "{{.State.Running}}", self.container), "false")
+        copied = Path(self.state) / "sentinel"
+        self.docker("cp", self.container + ":/home/user/sentinel", str(copied))
+        self.assertEqual(copied.read_text(), "sentinel")
+
+    def test_unknown_start_refuses_pause_but_allows_scoped_delete(self):
+        result = subprocess.run(
+            [str(ROOT / "dispatch.py")], env=self.fault_env("start", PALKA_TEST_FAIL="1"),
+            capture_output=True, text=True, timeout=20,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("synthetic-first-token", result.stdout + result.stderr)
+        saved_id = self.docker("inspect", "--format", "{{.Id}}", self.container)
+        for operation in ("spawn", "pause"):
+            refused = self.dispatch(operation)
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn("uncertain", refused.stderr)
+        failed_delete = subprocess.run(
+            [str(ROOT / "dispatch.py")],
+            env=self.fault_env("rm", PALKA_TEST_FAIL="1", ORB_OPERATION="delete"),
+            capture_output=True, text=True, timeout=20,
+        )
+        self.assertNotEqual(failed_delete.returncode, 0)
+        self.assertNotIn("synthetic-first-token", failed_delete.stdout + failed_delete.stderr)
+        self.assertIn("uncertain", self.dispatch("pause").stderr)
+        deleted = self.dispatch("delete")
+        self.assertEqual(deleted.returncode, 0, deleted.stderr)
+        self.assertEqual(self.docker("ps", "--all", "--quiet", "--filter", "id=" + saved_id), "")
 
     def test_snapshot_fan_out_keeps_independent_disks_and_no_spawn_credentials(self):
         snapshot_id = "test-snapshot-" + uuid.uuid4().hex

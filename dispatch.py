@@ -64,6 +64,12 @@ class DispatchError(Exception):
     """A safe message that can appear in provider and thread logs."""
 
 
+class DockerFailure(DispatchError):
+    def __init__(self, message: str, daemon_response: bool):
+        super().__init__(message)
+        self.daemon_response = daemon_response
+
+
 @dataclass(frozen=True)
 class Limits:
     cpus: float
@@ -218,7 +224,7 @@ def docker_command(deadline: float, *args: str) -> str:
     except OSError:
         raise DispatchError("Docker CLI could not start") from None
     try:
-        stdout, _ = process.communicate(timeout=remaining)
+        stdout, stderr = process.communicate(timeout=remaining)
     except BaseException as error:
         try:
             os.killpg(process.pid, signal.SIGKILL)
@@ -230,7 +236,10 @@ def docker_command(deadline: float, *args: str) -> str:
         raise
     if process.returncode:
         # Docker errors can include input values or output from the image.
-        raise DispatchError(f"Docker {args[0]} failed (exit {process.returncode})")
+        # Recognize only the CLI's explicit Engine response prefix. A changed
+        # format or a transport failure stays uncertain. Never emit the text.
+        raise DockerFailure(f"Docker {args[0]} failed (exit {process.returncode})",
+                            stderr.startswith("Error response from daemon:"))
     return stdout.strip()
 
 
@@ -276,10 +285,15 @@ def dispatch(operation: str, orb_id: str, image: str, deadline: float, state: Pa
             os.fsync(directory)
         finally:
             os.close(directory)
-        if action == "stop":
-            docker("stop", "--time", "10", container_id)
-        else:
-            docker("start", container_id)
+        try:
+            if action == "stop":
+                docker("stop", "--time", "10", container_id)
+            else:
+                docker("start", container_id)
+        except DockerFailure as error:
+            if error.daemon_response:
+                pending.unlink()
+            raise
         pending.unlink()
 
     if pending.exists():
@@ -289,8 +303,14 @@ def dispatch(operation: str, orb_id: str, image: str, deadline: float, state: Pa
         if container_id:
             if previous.get("container") != container_id:
                 raise DispatchError("container changed during recovery; inspect local state")
-            transition(previous["action"])
-            running = previous["action"] == "start"
+            if operation == "delete":
+                pass  # Removal targets this immutable ID, not a repeat start.
+            elif previous["action"] == "start" and running:
+                # Only one start was sent. The locked inspect observed its
+                # completed running state; do not send a second request.
+                pending.unlink()
+            else:
+                raise DispatchError("prior Docker transition is uncertain; operator quiescence is required before retry")
         else:
             pending.unlink()
 
@@ -354,6 +374,7 @@ def dispatch(operation: str, orb_id: str, image: str, deadline: float, state: Pa
                 docker("image", "tag", saved_id, reference)
     elif operation == "delete" and container_id:
         docker("rm", "--force", "--volumes", container_id)
+        pending.unlink(missing_ok=True)
 
     if operation in {"pause", "delete"}:
         with lock("admission", deadline):

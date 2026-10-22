@@ -107,7 +107,10 @@ There is no failure handler that clears failures or deletes runtime data.
 Stop sends SIGTERM to the service control group, including active dispatch
 clients. After 270 seconds, systemd sends SIGKILL to remaining processes.
 This bounds service stop, not Docker daemon work. A job can be interrupted.
-Retain recovery records and retry through dispatch after restart. Do not
+Retain recovery records and retry through dispatch after restart. An uncertain
+transition can require the [operator quiescence procedure](docker.md#concurrency-and-recovery)
+instead of automatic recovery. A stopped inspect result is not a completion
+fence for an old request. Do not
 assume stopping the provider stops Docker containers. A host restart also
 requires the same Docker storage and Palka state. Orb stop/start retains
 disk only, not RAM or running processes.

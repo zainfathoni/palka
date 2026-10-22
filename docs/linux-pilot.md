@@ -42,6 +42,14 @@ RAM checkpoint. Process-restart tests do not prove physical host-reboot or
 live provider-process recovery. Service verification checks the unit without
 starting it. See the [Docker limits](docker.md#local-limits-and-storage-admission).
 
+Uncertain Docker transitions can stop automatic recovery. Dispatch refuses
+pause or resume rather than replay a request whose daemon outcome is unknown.
+A confirmed Engine failure does not block a later pause or approved delete.
+An unknown stop can need an approved host reboot or another verified drain
+before safe resume; a provider restart alone is not enough. See the
+[quiescence procedure](docker.md#concurrency-and-recovery). This limits the
+initial pilot to monitored operation, not unattended availability.
+
 ## Synthetic measurements
 
 One cached-fixture run on 2026-10-22 used 0.5 CPU, 128 MiB memory, 64 processes,
@@ -131,6 +139,8 @@ command line, shell history, or evidence file. Follow the
 6. Under approval to interrupt the provider, stop and start it while preserving
    state. Check recovery, repeat jobs, and visible failures. A physical host
    reboot requires its own host-change approval and is **not run**.
+   Stop the pilot if dispatch reports an uncertain transition. Do not clear
+   records, assume the Orb is stopped, or keep retrying as a repair.
 7. Obtain approval to delete only the named disposable test threads/Orbs.
    Confirm their containers disappear and unrelated resources and shared
    snapshots remain. Local snapshot cleanup is a separate explicit scope.
