@@ -1,5 +1,10 @@
 # Controlled Linux test
 
+The live pilot is paused by owner decision. See
+[ADR 0001](adr/0001-pause-for-personal-account-support.md). The procedure below
+is retained for a future approved test, not an instruction to activate the
+provider. Earlier pilot approval no longer applies.
+
 Status: local synthetic Docker validation is available. Live Amp connection,
 provider registration, and service activation are **not run**. This guide
 does not authorize those actions. The Linux delivery parent remains open

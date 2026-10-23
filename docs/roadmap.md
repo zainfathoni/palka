@@ -1,5 +1,9 @@
 # Delivery plan
 
+All unfinished work is paused by owner decision. See
+[ADR 0001](adr/0001-pause-for-personal-account-support.md). The plan below is
+retained for reference; it is not an instruction to resume work.
+
 The [GitHub issue graph](https://github.com/zainfathoni/palka/issues) is the
 source of truth for task state. Parent-child links define scope. Native
 blocked-by links define execution order. A parent does not replace a blocker.

@@ -7,16 +7,22 @@ extension or dependency.
 
 ## Status
 
+Development and live validation are paused. Amp's documented self-hosted Orb
+registration requires a workspace, which does not meet the intended
+personal-account use. See [ADR 0001](docs/adr/0001-pause-for-personal-account-support.md)
+for the decision and conditions to resume.
+
 This repository contains an initial Docker lifecycle dispatch program and
 its tests, with concurrent-job locking and interrupted-job recovery. Project
 snapshots, resource limits, storage admission checks, sanitized diagnostics,
 and an opt-in Linux service example are implemented. Live Amp validation is
 not run. There is no automatic installer or active Orb provider.
-Use the [controlled Linux test guide](docs/linux-pilot.md) for the next steps
-and the required operator approvals. This is not production-validated.
+The [controlled Linux test guide](docs/linux-pilot.md) preserves the procedure
+for a future approved test. This is not production-validated.
 
-The first runtime will use Docker on Linux. Apple Containers on Apple Silicon
-macOS is next. E2B Embed is a possible later option, not the initial stack.
+The planned backend order is Docker on Linux, then Apple Containers on Apple
+Silicon macOS. Work on both is paused. E2B Embed remains a possible later
+option, not the initial stack.
 
 ## Boundary
 
